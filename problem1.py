@@ -215,8 +215,10 @@ class LunarExplorer:
     """Tkinter application: Parts A & B combined."""
 
     COLOURMAPS = [
+        # Elevation is a sequential quantity: prefer sequential maps over
+        # diverging schemes such as coolwarm.
         "terrain", "viridis", "cividis", "inferno",
-        "gray", "coolwarm", "RdYlBu_r", "gist_earth",
+        "magma", "plasma", "gray", "gist_earth",
     ]
     VIEW_MODES = [
         "2D Contour Map",
@@ -256,6 +258,7 @@ class LunarExplorer:
         self._cached_slope_idx = -1
         self._cached_suit = None
         self._cached_suit_idx = -1
+        self._pending_render_job = None
 
         # -- build UI & first render --
         self._build_gui()
@@ -377,7 +380,7 @@ class LunarExplorer:
         self.azi_var = tk.IntVar(value=-135)
         self.azi_scale = ttk.Scale(frm, from_=-180, to=180,
                                    variable=self.azi_var, orient=tk.HORIZONTAL,
-                                   command=self._on_3d_param)
+                                   command=lambda _: self._on_3d_param("azi"))
         self.azi_scale.pack(fill=tk.X)
         self.azi_lbl = ttk.Label(frm, text="-135 deg")
         self.azi_lbl.pack(anchor=tk.W)
@@ -386,7 +389,7 @@ class LunarExplorer:
         self.elev_var = tk.IntVar(value=45)
         self.elev_scale = ttk.Scale(frm, from_=5, to=90,
                                     variable=self.elev_var, orient=tk.HORIZONTAL,
-                                    command=self._on_3d_param)
+                                    command=lambda _: self._on_3d_param("elev"))
         self.elev_scale.pack(fill=tk.X)
         self.elev_lbl = ttk.Label(frm, text="45 deg")
         self.elev_lbl.pack(anchor=tk.W)
@@ -395,7 +398,7 @@ class LunarExplorer:
         self.vexag_var = tk.DoubleVar(value=3.0)
         self.vexag_scale = ttk.Scale(frm, from_=0.5, to=15.0,
                                      variable=self.vexag_var, orient=tk.HORIZONTAL,
-                                     command=self._on_3d_param)
+                                     command=lambda _: self._on_3d_param("vexag"))
         self.vexag_scale.pack(fill=tk.X)
         self.vexag_lbl = ttk.Label(frm, text="3.0x")
         self.vexag_lbl.pack(anchor=tk.W)
@@ -591,6 +594,13 @@ class LunarExplorer:
         return None
 
     def _render(self, *_):
+        # Clear any queued render to avoid duplicate redraws.
+        if self._pending_render_job is not None:
+            try:
+                self.root.after_cancel(self._pending_render_job)
+            except Exception:
+                pass
+            self._pending_render_job = None
         mode = self.view_var.get()
         if mode == self.VIEW_MODES[0]:
             self._render_2d()
@@ -598,6 +608,37 @@ class LunarExplorer:
             self._render_3d()
         else:
             self._render_sidebyside()
+
+    def _schedule_render(self, delay_ms=80):
+        """Debounce expensive full redraws while sliders are dragged."""
+        if self._pending_render_job is not None:
+            self.root.after_cancel(self._pending_render_job)
+        self._pending_render_job = self.root.after(delay_ms, self._render)
+
+    def _update_3d_view_only(self):
+        """
+        Cheap interaction path for azimuth/elevation changes:
+        update camera angle without rebuilding all artists.
+        """
+        if self.ax3d is None:
+            return False
+
+        elev = int(float(self.elev_var.get()))
+        azim = int(float(self.azi_var.get()))
+        self.ax3d.view_init(elev=elev, azim=azim)
+
+        if self.view_var.get() == self.VIEW_MODES[1]:
+            hm = self._cur_hm()
+            vexag = float(self.vexag_var.get())
+            self.ax3d.set_title(
+                f"Lunar South Pole  -  {hm.scale_label}  (3D Displacement Map)\n"
+                f"Vert. exagg. {vexag:.1f}x   "
+                f"Azimuth {azim} deg   "
+                f"Elev {elev} deg",
+                fontsize=11, fontweight="bold", pad=6)
+
+        self.canvas.draw_idle()
+        return True
 
     # ==================================================================
     #  2-D CONTOUR / COLOUR-MAP VIEW  (Part A)
@@ -856,8 +897,8 @@ class LunarExplorer:
                 alpha=0.6)
             if self.contour_labels_on.get() and len(levels) <= 25:
                 ax.clabel(cs, inline=True, fontsize=6, fmt="%.0f m")
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[WARN] 2D contour overlay failed: {exc}", file=sys.stderr)
 
     def _draw_contours_3d(self, ax3, X, Y, Z, vmin, vmax, vexag):
         """Project contour lines onto the 3-D displaced surface."""
@@ -874,8 +915,9 @@ class LunarExplorer:
                 colors=self.contour_col_var.get(),
                 linewidths=float(self.contour_lw_var.get()),
                 alpha=0.7)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[WARN] 3D contour projection failed: {exc}",
+                  file=sys.stderr)
 
     def _overlay_illumination(self, ax):
         """Semi-transparent illumination layer on 2-D axes."""
@@ -957,8 +999,9 @@ class LunarExplorer:
                        slope_deg[::step, ::step],
                        levels=[thresh], colors=["red"],
                        linewidths=1.2, linestyles="dashed", alpha=0.8)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[WARN] Slope threshold contour failed: {exc}",
+                  file=sys.stderr)
 
     # -- C2: Permanently Shadowed Regions (PSR) indicators -------------
     def _overlay_psr(self, ax):
@@ -1001,8 +1044,9 @@ class LunarExplorer:
                        il_norm[::step, ::step],
                        levels=[thresh_pct], colors=["dodgerblue"],
                        linewidths=1.0, linestyles="solid", alpha=0.9)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[WARN] PSR boundary contour failed: {exc}",
+                  file=sys.stderr)
 
     # -- C3: Landing Suitability Score ---------------------------------
     def _compute_suitability(self):
@@ -1381,13 +1425,18 @@ class LunarExplorer:
         if self.contour_on.get():
             self._render()
 
-    def _on_3d_param(self, *_):
+    def _on_3d_param(self, changed="view"):
         self.azi_lbl.config(text=f"{int(float(self.azi_var.get()))} deg")
         self.elev_lbl.config(text=f"{int(float(self.elev_var.get()))} deg")
         self.vexag_lbl.config(text=f"{float(self.vexag_var.get()):.1f}x")
         mode = self.view_var.get()
         if mode in (self.VIEW_MODES[1], self.VIEW_MODES[2]):
-            self._render()
+            # Azimuth/elevation can be updated interactively without
+            # rebuilding the full figure. Vertical exaggeration changes
+            # surface geometry, so keep it as a full render (debounced).
+            if changed in ("azi", "elev") and self._update_3d_view_only():
+                return
+            self._schedule_render()
 
     # ==================================================================
     #  HELPERS
