@@ -2,13 +2,10 @@
 COMP4097 - Problem 1: Explorative Visualisation
 Lunar South Pole Interactive Explorer for Artemis III Landing Site Selection
 
-Parts A, B & C:
+Parts A & B:
   A – Multi-scale interactive maps, click-to-sample, zoom, illumination overlay
   B – Side-by-side comparison of 3D displacement-map rendering vs isoline/
       isocontour representation, with full GUI parameter control
-  C – Creative additions: slope/gradient overlay, permanently shadowed region
-      (PSR) detection, composite landing suitability scoring heatmap,
-      elevation profile cross-sections
 
 Lecture concepts applied:
   - Visualisation pipeline  (data -> format -> filter -> map -> render)
@@ -19,11 +16,8 @@ Lecture concepts applied:
   - Inverse mapping  (click-to-sample)
   - Multi-scale overview -> detail
   - Multi-variate overlay  (elevation + illumination)
-  - Derived scalar quantities from gradient  (slope = |grad f|)
-  - Information layering  (PSR regions, suitability scoring)
-  - Filtering / slicing  (1D cross-sections through 2D scalar fields)
 
-Requirements: numpy, matplotlib, scipy, Pillow, rasterio (or tifffile fallback)
+Requirements: numpy, matplotlib, Pillow, rasterio (or tifffile fallback)
 Run:  python3 problem1.py
 Dataset:  ./dataset/heightmaps/*.tif   ./dataset/illumination/*.tif
 """
@@ -40,7 +34,6 @@ from matplotlib.figure import Figure
 from matplotlib.widgets import RectangleSelector
 import matplotlib.colors as mcolors
 from mpl_toolkits.mplot3d import Axes3D          # 3-D displacement plots
-from scipy import ndimage                         # Part C: slope / gradient
 
 # -- optional I/O backends --
 try:
@@ -248,15 +241,6 @@ class LunarExplorer:
         self.zoom_stack: list[tuple] = []
         self.cur_xlim = self.cur_ylim = None
 
-        # Part C: profile cross-section state
-        self.profile_pts: list[tuple] = []   # [(x1,y1), (x2,y2)]
-
-        # Part C: cached derived layers (invalidated on scale change)
-        self._cached_slope = None
-        self._cached_slope_idx = -1
-        self._cached_suit = None
-        self._cached_suit_idx = -1
-
         # -- build UI & first render --
         self._build_gui()
         self._render()
@@ -431,107 +415,12 @@ class LunarExplorer:
                      values=["hot", "YlOrRd", "magma", "inferno", "gray_r"],
                      state="readonly", width=14).pack(fill=tk.X)
 
-        # ==============================================================
-        #  PART C — Creative Analysis Overlays
-        # ==============================================================
-
-        # -- C1: Slope / Gradient overlay ----------------------------------
-        frm = ttk.LabelFrame(parent,
-                             text="Slope / Gradient  (Part C)", padding=5)
-        frm.pack(fill=tk.X, **PAD)
-
-        self.slope_on = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm, text="Show slope overlay",
-                        variable=self.slope_on,
-                        command=self._render).pack(anchor=tk.W)
-
-        ttk.Label(frm, text="Danger threshold (deg):").pack(
-            anchor=tk.W, pady=(4, 0))
-        self.slope_thresh_var = tk.DoubleVar(value=15.0)
-        ttk.Scale(frm, from_=2, to=45,
-                  variable=self.slope_thresh_var, orient=tk.HORIZONTAL,
-                  command=lambda _: self._render()).pack(fill=tk.X)
-
-        ttk.Label(frm, text="Slope opacity:").pack(anchor=tk.W, pady=(4, 0))
-        self.slope_alpha_var = tk.DoubleVar(value=0.5)
-        ttk.Scale(frm, from_=0.1, to=0.9,
-                  variable=self.slope_alpha_var, orient=tk.HORIZONTAL,
-                  command=lambda _: self._render()).pack(fill=tk.X)
-
-        # -- C2: Permanently Shadowed Regions (PSR) indicators -------------
-        frm = ttk.LabelFrame(parent,
-                             text="Shadowed Regions / PSR  (Part C)", padding=5)
-        frm.pack(fill=tk.X, **PAD)
-
-        self.psr_on = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm, text="Highlight permanently shadowed regions",
-                        variable=self.psr_on,
-                        command=self._render).pack(anchor=tk.W)
-
-        ttk.Label(frm, text="Shadow threshold (percentile):").pack(
-            anchor=tk.W, pady=(4, 0))
-        self.psr_thresh_var = tk.DoubleVar(value=10.0)
-        ttk.Scale(frm, from_=1, to=40,
-                  variable=self.psr_thresh_var, orient=tk.HORIZONTAL,
-                  command=lambda _: self._render()).pack(fill=tk.X)
-
-        # -- C3: Landing Suitability Score ---------------------------------
-        frm = ttk.LabelFrame(parent,
-                             text="Landing Suitability Score  (Part C)",
-                             padding=5)
-        frm.pack(fill=tk.X, **PAD)
-
-        self.suit_on = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm, text="Show suitability heatmap",
-                        variable=self.suit_on,
-                        command=self._render).pack(anchor=tk.W)
-
-        ttk.Label(frm, text="Weight — flat terrain:").pack(
-            anchor=tk.W, pady=(4, 0))
-        self.w_flat_var = tk.DoubleVar(value=0.4)
-        ttk.Scale(frm, from_=0, to=1,
-                  variable=self.w_flat_var, orient=tk.HORIZONTAL,
-                  command=lambda _: self._render()).pack(fill=tk.X)
-
-        ttk.Label(frm, text="Weight — illumination:").pack(
-            anchor=tk.W, pady=(4, 0))
-        self.w_illum_var = tk.DoubleVar(value=0.35)
-        ttk.Scale(frm, from_=0, to=1,
-                  variable=self.w_illum_var, orient=tk.HORIZONTAL,
-                  command=lambda _: self._render()).pack(fill=tk.X)
-
-        ttk.Label(frm, text="Weight — PSR proximity:").pack(
-            anchor=tk.W, pady=(4, 0))
-        self.w_psr_var = tk.DoubleVar(value=0.25)
-        ttk.Scale(frm, from_=0, to=1,
-                  variable=self.w_psr_var, orient=tk.HORIZONTAL,
-                  command=lambda _: self._render()).pack(fill=tk.X)
-
-        ttk.Label(frm, text="Suitability opacity:").pack(
-            anchor=tk.W, pady=(4, 0))
-        self.suit_alpha_var = tk.DoubleVar(value=0.55)
-        ttk.Scale(frm, from_=0.1, to=0.9,
-                  variable=self.suit_alpha_var, orient=tk.HORIZONTAL,
-                  command=lambda _: self._render()).pack(fill=tk.X)
-
-        # -- C4: Elevation Profile Cross-Section ---------------------------
-        frm = ttk.LabelFrame(parent,
-                             text="Elevation Profile  (Part C)", padding=5)
-        frm.pack(fill=tk.X, **PAD)
-
-        self.profile_mode = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm, text="Profile mode (click 2 pts on map)",
-                        variable=self.profile_mode).pack(anchor=tk.W)
-        ttk.Button(frm, text="Clear Profile",
-                   command=self._clear_profile).pack(fill=tk.X, pady=(4, 0))
-
         # -- Navigation ----------------------------------------------------
         frm = ttk.LabelFrame(parent, text="Navigation", padding=5)
         frm.pack(fill=tk.X, **PAD)
 
         ttk.Label(frm,
                   text="Left-click  -> sample values\n"
-                       "  (or set profile pts)\n"
                        "Right-drag -> zoom into region\n"
                        "(2D view only)",
                   font=("Helvetica", 9), foreground="#555").pack(anchor=tk.W)
@@ -544,7 +433,7 @@ class LunarExplorer:
         frm = ttk.LabelFrame(parent, text="Sampled Point", padding=5)
         frm.pack(fill=tk.X, **PAD)
 
-        self.sample_text = tk.Text(frm, height=10, width=32,
+        self.sample_text = tk.Text(frm, height=7, width=32,
                                    font=("Courier", 9), state=tk.DISABLED,
                                    bg="#f5f5f0", relief=tk.FLAT)
         self.sample_text.pack(fill=tk.X)
@@ -624,18 +513,12 @@ class LunarExplorer:
         # 3 -- illumination overlay
         self._overlay_illumination(self.ax)
 
-        # 4 -- Part C overlays
-        self._overlay_slope(self.ax)
-        self._overlay_psr(self.ax)
-        self._overlay_suitability(self.ax)
-        self._draw_profile_on_map(self.ax)
-
-        # 5 -- zoom limits
+        # 4 -- zoom limits
         if self.cur_xlim is not None:
             self.ax.set_xlim(self.cur_xlim)
             self.ax.set_ylim(self.cur_ylim)
 
-        # 6 -- labels & colour bar
+        # 5 -- labels & colour bar
         self.ax.set_title(
             f"Lunar South Pole  -  {hm.scale_label}  (2D Contour Map)",
             fontsize=12, fontweight="bold", pad=8)
@@ -644,7 +527,7 @@ class LunarExplorer:
             self.im, ax=self.ax, label="Elevation (m)",
             shrink=0.82, pad=0.02, aspect=30)
 
-        # 7 -- rectangle selector for zoom (right-drag)
+        # 6 -- rectangle selector for zoom (right-drag)
         self.selector = RectangleSelector(
             self.ax, self._on_rect_select, useblit=True, button=[3],
             minspanx=5, minspany=5, spancoords="pixels",
@@ -762,10 +645,6 @@ class LunarExplorer:
             aspect="equal", interpolation="bilinear")
         self._overlay_contours_2d(ax2d, data, ext, vmin, vmax)
         self._overlay_illumination(ax2d)
-        self._overlay_slope(ax2d)
-        self._overlay_psr(ax2d)
-        self._overlay_suitability(ax2d)
-        self._draw_profile_on_map(ax2d)
         if self.cur_xlim is not None:
             ax2d.set_xlim(self.cur_xlim)
             ax2d.set_ylim(self.cur_ylim)
@@ -894,312 +773,6 @@ class LunarExplorer:
                   extent=il.extent, origin="upper",
                   alpha=float(self.opacity_var.get()), aspect="equal")
 
-    # ==================================================================
-    #  PART C — CREATIVE ANALYSIS OVERLAYS
-    # ==================================================================
-
-    # -- C1: Slope / Gradient overlay ----------------------------------
-    def _compute_slope_grid(self):
-        """
-        Lecture 4 — derived scalar quantities from gradient.
-        Compute slope magnitude |grad f| from elevation, convert to degrees.
-        Slope = arctan(|grad f|) is critical for landing safety.
-        """
-        hm = self._cur_hm()
-        if self._cached_slope is not None and self._cached_slope_idx == self.scale_idx:
-            return self._cached_slope
-        data = hm.data
-        # Compute gradient using Sobel for better noise handling
-        dx = ndimage.sobel(data, axis=1).astype(np.float64)
-        dy = ndimage.sobel(data, axis=0).astype(np.float64)
-        # Account for pixel spacing if known
-        if hm.pixel_size is not None and hm.pixel_size > 0:
-            dx /= (8.0 * hm.pixel_size)   # Sobel divides by 8*spacing
-            dy /= (8.0 * hm.pixel_size)
-        else:
-            dx /= 8.0
-            dy /= 8.0
-        grad_mag = np.sqrt(dx**2 + dy**2)
-        slope_deg = np.degrees(np.arctan(grad_mag))
-        self._cached_slope = slope_deg
-        self._cached_slope_idx = self.scale_idx
-        return slope_deg
-
-    def _overlay_slope(self, ax):
-        """
-        Overlay slope as a diverging colourmap highlighting dangerous areas.
-        Green = flat/safe, yellow = moderate, red = dangerously steep.
-        """
-        if not self.slope_on.get():
-            return
-        hm = self._cur_hm()
-        slope_deg = self._compute_slope_grid()
-        thresh = float(self.slope_thresh_var.get())
-        # Create a colourmap: green (safe) -> yellow (caution) -> red (danger)
-        from matplotlib.colors import LinearSegmentedColormap
-        slope_cmap = LinearSegmentedColormap.from_list(
-            "slope_safety",
-            [(0, "green"), (0.5, "yellow"), (1.0, "red")])
-        ax.imshow(slope_deg, cmap=slope_cmap,
-                  extent=hm.extent, origin="upper",
-                  vmin=0, vmax=thresh * 2,
-                  alpha=float(self.slope_alpha_var.get()),
-                  aspect="equal")
-        # Add a contour at the danger threshold
-        h, w = slope_deg.shape
-        ext = hm.extent
-        xs = np.linspace(ext[0], ext[1], w)
-        ys = np.linspace(ext[3], ext[2], h)
-        X, Y = np.meshgrid(xs, ys)
-        step = max(1, min(h, w) // 600)
-        try:
-            ax.contour(X[::step, ::step], Y[::step, ::step],
-                       slope_deg[::step, ::step],
-                       levels=[thresh], colors=["red"],
-                       linewidths=1.2, linestyles="dashed", alpha=0.8)
-        except Exception:
-            pass
-
-    # -- C2: Permanently Shadowed Regions (PSR) indicators -------------
-    def _overlay_psr(self, ax):
-        """
-        Identify permanently shadowed regions from illumination data.
-        Low illumination => likely PSR => potential water ice deposits.
-        Overlaid as hatched semi-transparent regions.
-        """
-        if not self.psr_on.get():
-            return
-        il = self._cur_il()
-        if il is None:
-            return
-        il_data = il.data.copy()
-        lo_i, hi_i = np.nanmin(il_data), np.nanmax(il_data)
-        if hi_i <= lo_i:
-            return
-        il_norm = (il_data - lo_i) / (hi_i - lo_i)
-
-        thresh_pct = float(self.psr_thresh_var.get()) / 100.0
-        psr_mask = il_norm <= thresh_pct
-
-        # Draw as a blue-tinted semi-transparent overlay
-        psr_rgba = np.zeros((*psr_mask.shape, 4), dtype=np.float64)
-        psr_rgba[psr_mask, 0] = 0.1    # R
-        psr_rgba[psr_mask, 1] = 0.15   # G
-        psr_rgba[psr_mask, 2] = 0.9    # B
-        psr_rgba[psr_mask, 3] = 0.4    # A
-        ax.imshow(psr_rgba, extent=il.extent, origin="upper", aspect="equal")
-
-        # Add contour boundary around PSR regions
-        h, w = il_norm.shape
-        ext = il.extent
-        xs = np.linspace(ext[0], ext[1], w)
-        ys = np.linspace(ext[3], ext[2], h)
-        X, Y = np.meshgrid(xs, ys)
-        step = max(1, min(h, w) // 600)
-        try:
-            ax.contour(X[::step, ::step], Y[::step, ::step],
-                       il_norm[::step, ::step],
-                       levels=[thresh_pct], colors=["dodgerblue"],
-                       linewidths=1.0, linestyles="solid", alpha=0.9)
-        except Exception:
-            pass
-
-    # -- C3: Landing Suitability Score ---------------------------------
-    def _compute_suitability(self):
-        """
-        Multi-variate derived quantity (Lectures 3-4):
-        Combine flatness, illumination, and PSR proximity into a single
-        composite score. Uses normalised weighting of three criteria:
-          - Flatness: 1 - slope/max_slope  (flat = good)
-          - Illumination: normalised brightness  (well-lit = good)
-          - PSR proximity: distance to nearest shadow  (close = good
-            for science, not too close for safety)
-        """
-        hm = self._cur_hm()
-        if (self._cached_suit is not None
-                and self._cached_suit_idx == self.scale_idx):
-            return self._cached_suit
-
-        # Flatness component (from slope)
-        slope_deg = self._compute_slope_grid()
-        max_slope = max(np.nanmax(slope_deg), 1.0)
-        flatness = 1.0 - np.clip(slope_deg / max_slope, 0, 1)
-
-        # Illumination component
-        il = self._cur_il()
-        if il is not None:
-            il_data = il.data.copy()
-            lo_i, hi_i = np.nanmin(il_data), np.nanmax(il_data)
-            if hi_i > lo_i:
-                illum_score = (il_data - lo_i) / (hi_i - lo_i)
-            else:
-                illum_score = np.ones_like(il_data) * 0.5
-            # Resample to match heightmap size if different
-            if illum_score.shape != hm.data.shape:
-                from PIL import Image as _PILImg
-                illum_pil = _PILImg.fromarray(illum_score)
-                illum_pil = illum_pil.resize(
-                    (hm.width, hm.height), _PILImg.BILINEAR)
-                illum_score = np.array(illum_pil, dtype=np.float64)
-        else:
-            illum_score = np.ones_like(hm.data) * 0.5
-
-        # PSR proximity component
-        # Compute distance transform from PSR boundary: close to PSR
-        # is scientifically valuable (water ice) but must not be *in* PSR
-        psr_thresh = float(self.psr_thresh_var.get()) / 100.0
-        psr_mask = illum_score <= psr_thresh
-        if np.any(psr_mask) and not np.all(psr_mask):
-            dist_to_psr = ndimage.distance_transform_edt(~psr_mask)
-            max_dist = max(np.nanmax(dist_to_psr), 1.0)
-            # Gaussian-like proximity: peaks near PSR, decays with distance
-            # Penalise being *inside* PSR (too dark), reward being nearby
-            psr_prox = np.exp(-0.5 * (dist_to_psr / (max_dist * 0.15))**2)
-            psr_prox[psr_mask] = 0.1   # inside PSR = low score (too dark)
-        else:
-            psr_prox = np.ones_like(hm.data) * 0.5
-
-        # Weighted combination
-        w_f = float(self.w_flat_var.get())
-        w_i = float(self.w_illum_var.get())
-        w_p = float(self.w_psr_var.get())
-        total_w = w_f + w_i + w_p
-        if total_w < 1e-6:
-            total_w = 1.0
-        score = (w_f * flatness + w_i * illum_score + w_p * psr_prox) / total_w
-        score = np.clip(score, 0, 1)
-
-        self._cached_suit = score
-        self._cached_suit_idx = self.scale_idx
-        return score
-
-    def _overlay_suitability(self, ax):
-        """
-        Visualise composite landing suitability as a heatmap overlay.
-        Hot colours = good candidate sites; cool colours = poor sites.
-        """
-        if not self.suit_on.get():
-            return
-        # Invalidate cache — weights or PSR threshold may have changed
-        self._cached_suit = None
-        self._cached_suit_idx = -1
-        hm = self._cur_hm()
-        score = self._compute_suitability()
-        ax.imshow(score, cmap="RdYlGn", vmin=0, vmax=1,
-                  extent=hm.extent, origin="upper",
-                  alpha=float(self.suit_alpha_var.get()),
-                  aspect="equal")
-
-    # -- C4: Elevation Profile Cross-Section ---------------------------
-    def _draw_profile_on_map(self, ax):
-        """Draw profile line and endpoint markers on the 2D map."""
-        if len(self.profile_pts) == 0:
-            return
-        # Draw placed points
-        for px, py in self.profile_pts:
-            mk, = ax.plot(px, py, "mo", markersize=10, markeredgewidth=2,
-                          markerfacecolor="none")
-            mk._profile_marker = True
-        # Draw line if we have both points
-        if len(self.profile_pts) == 2:
-            (x1, y1), (x2, y2) = self.profile_pts
-            line, = ax.plot([x1, x2], [y1, y2], "m-",
-                            linewidth=2, alpha=0.8)
-            line._profile_marker = True
-
-    def _render_profile_subplot(self):
-        """
-        Lecture concept: filtering / slicing through 2D scalar data.
-        Extract a 1D cross-section along the user-drawn line and
-        display it as an elevation profile in a popup window.
-        """
-        if len(self.profile_pts) != 2:
-            return
-        hm = self._cur_hm()
-        (x1, y1), (x2, y2) = self.profile_pts
-
-        # Sample N points along the line
-        N = 500
-        xs = np.linspace(x1, x2, N)
-        ys = np.linspace(y1, y2, N)
-        elevs = np.array([hm.sample(x, y) for x, y in zip(xs, ys)])
-
-        # Compute distance along profile in metres
-        if hm.pixel_size is not None:
-            dists = np.sqrt((xs - x1)**2 + (ys - y1)**2)
-        else:
-            dists = np.linspace(0, np.sqrt((x2-x1)**2 + (y2-y1)**2), N)
-
-        # Also sample illumination if available
-        il = self._cur_il()
-        illum_vals = None
-        if il is not None:
-            illum_vals = np.array([il.sample(x, y) for x, y in zip(xs, ys)])
-
-        # Create popup window
-        if hasattr(self, '_profile_win') and self._profile_win is not None:
-            try:
-                self._profile_win.destroy()
-            except Exception:
-                pass
-
-        self._profile_win = tk.Toplevel(self.root)
-        self._profile_win.title("Elevation Profile  -  Cross Section")
-        self._profile_win.geometry("800x500")
-
-        n_plots = 1 + (1 if illum_vals is not None else 0)
-        pfig = Figure(figsize=(9, 5), dpi=100, facecolor="#f8f8f4")
-
-        # Elevation profile
-        ax_el = pfig.add_subplot(n_plots, 1, 1)
-        ax_el.fill_between(dists, elevs, alpha=0.3, color="sienna")
-        ax_el.plot(dists, elevs, "k-", linewidth=1.2)
-        ax_el.set_ylabel("Elevation (m)")
-        ax_el.set_title("Elevation Profile Cross-Section", fontweight="bold")
-        ax_el.grid(True, alpha=0.3)
-
-        # Mark slope danger zones on the profile
-        slope_deg = self._compute_slope_grid()
-        slope_along = np.array([
-            slope_deg[min(int(round(r)), slope_deg.shape[0]-1),
-                      min(int(round(c)), slope_deg.shape[1]-1)]
-            for r, c in (hm._xy_to_rowcol(x, y)
-                         for x, y in zip(xs, ys))
-        ])
-        thresh = float(self.slope_thresh_var.get())
-        danger = slope_along > thresh
-        if np.any(danger):
-            ax_el.fill_between(dists, elevs, where=danger,
-                               alpha=0.3, color="red",
-                               label=f"Slope > {thresh:.0f} deg")
-            ax_el.legend(fontsize=8, loc="upper right")
-
-        # Illumination profile
-        if illum_vals is not None:
-            ax_il = pfig.add_subplot(n_plots, 1, 2, sharex=ax_el)
-            ax_il.fill_between(dists, illum_vals, alpha=0.3, color="orange")
-            ax_il.plot(dists, illum_vals, color="darkorange", linewidth=1.2)
-            ax_il.set_ylabel("Illumination")
-            ax_il.set_xlabel("Distance along profile (m)")
-            ax_il.grid(True, alpha=0.3)
-        else:
-            ax_el.set_xlabel("Distance along profile (m)")
-
-        pfig.tight_layout()
-        pcanvas = FigureCanvasTkAgg(pfig, master=self._profile_win)
-        pcanvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        pcanvas.draw()
-
-    def _clear_profile(self):
-        self.profile_pts.clear()
-        if hasattr(self, '_profile_win') and self._profile_win is not None:
-            try:
-                self._profile_win.destroy()
-            except Exception:
-                pass
-            self._profile_win = None
-        self._render()
-
     def _prepare_3d_grid(self, data, ext):
         """Build X, Y, Z meshgrids for 3-D surface, sub-sampled for speed."""
         h, w = data.shape
@@ -1257,9 +830,8 @@ class LunarExplorer:
     # ==================================================================
 
     def _on_click(self, event):
-        """Left-click -> sample values or set profile points.
-        Implements the inverse mapping concept from Lecture 2.
-        Part C adds slope, suitability readout and profile cross-sections."""
+        """Left-click -> sample elevation (& illumination) at pointer.
+        Implements the inverse mapping concept from Lecture 2."""
         if event.button != 1:
             return
         target_ax = self.ax
@@ -1269,17 +841,6 @@ class LunarExplorer:
             return
 
         x, y = event.xdata, event.ydata
-
-        # -- Profile mode: collect two points, then show cross-section --
-        if self.profile_mode.get():
-            self.profile_pts.append((x, y))
-            if len(self.profile_pts) > 2:
-                self.profile_pts = self.profile_pts[-2:]
-            self._render()
-            if len(self.profile_pts) == 2:
-                self._render_profile_subplot()
-            return
-
         hm = self._cur_hm()
         elev = hm.sample(x, y)
 
@@ -1294,7 +855,6 @@ class LunarExplorer:
         lines.append(f"Elevation: {elev:>10.1f} m")
         lines.append(f"           ({elev/1000:.2f} km)")
 
-        # Illumination readout
         il = self._cur_il()
         if il is not None:
             iv = il.sample(x, y)
@@ -1304,29 +864,6 @@ class LunarExplorer:
                 lines.append(f"           ({iv*100:.1f} %)")
             elif il_max <= 100.1:
                 lines.append(f"           ({iv:.1f} %)")
-
-        # Part C: slope readout
-        try:
-            slope_grid = self._compute_slope_grid()
-            row, col = hm._xy_to_rowcol(x, y)
-            if 0 <= row < slope_grid.shape[0] and 0 <= col < slope_grid.shape[1]:
-                sv = slope_grid[row, col]
-                thresh = float(self.slope_thresh_var.get())
-                flag = " STEEP!" if sv > thresh else ""
-                lines.append(f"Slope  :  {sv:>8.1f} deg{flag}")
-        except Exception:
-            pass
-
-        # Part C: suitability readout
-        try:
-            if self.suit_on.get():
-                suit = self._compute_suitability()
-                row, col = hm._xy_to_rowcol(x, y)
-                if 0 <= row < suit.shape[0] and 0 <= col < suit.shape[1]:
-                    sc = suit[row, col]
-                    lines.append(f"Suitab.:  {sc:>8.2f} / 1.0")
-        except Exception:
-            pass
 
         self._set_textbox(self.sample_text, "\n".join(lines))
 
@@ -1366,12 +903,6 @@ class LunarExplorer:
         self.scale_idx = self.scale_var.get()
         self.zoom_stack.clear()
         self.cur_xlim = self.cur_ylim = None
-        # Invalidate Part C caches
-        self._cached_slope = None
-        self._cached_slope_idx = -1
-        self._cached_suit = None
-        self._cached_suit_idx = -1
-        self.profile_pts.clear()
         self._refresh_stats()
         self._render()
 
