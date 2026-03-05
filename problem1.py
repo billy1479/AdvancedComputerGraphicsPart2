@@ -249,6 +249,7 @@ class LunarExplorer:
         self.scale_idx = 0
         self.zoom_stack: list[tuple] = []
         self.cur_xlim = self.cur_ylim = None
+        self._press_xy = None
 
         # Part C: profile cross-section state
         self.profile_pts: list[tuple] = []   # [(x1,y1), (x2,y2)]
@@ -535,6 +536,7 @@ class LunarExplorer:
         ttk.Label(frm,
                   text="Left-click  -> sample values\n"
                        "  (or set profile pts)\n"
+                       "Left-drag  -> zoom into region\n"
                        "Right-drag -> zoom into region\n"
                        "(2D view only)",
                   font=("Helvetica", 9), foreground="#555").pack(anchor=tk.W)
@@ -575,7 +577,8 @@ class LunarExplorer:
         tb_frame.pack(fill=tk.X)
         self.toolbar = NavigationToolbar2Tk(self.canvas, tb_frame)
 
-        self.canvas.mpl_connect("button_press_event", self._on_click)
+        self.canvas.mpl_connect("button_press_event", self._on_mouse_press)
+        self.canvas.mpl_connect("button_release_event", self._on_click)
 
         self.selector = None
         self.cbar = None
@@ -685,9 +688,9 @@ class LunarExplorer:
             self.im, ax=self.ax, label="Elevation (m)",
             shrink=0.82, pad=0.02, aspect=30)
 
-        # 7 -- rectangle selector for zoom (right-drag)
+        # 7 -- rectangle selector for zoom (left/right drag)
         self.selector = RectangleSelector(
-            self.ax, self._on_rect_select, useblit=True, button=[3],
+            self.ax, self._on_rect_select, useblit=True, button=[1, 3],
             minspanx=5, minspany=5, spancoords="pixels",
             interactive=True,
             props=dict(facecolor="cyan", edgecolor="white",
@@ -854,7 +857,7 @@ class LunarExplorer:
 
         # rectangle selector on the 2-D panel
         self.selector = RectangleSelector(
-            ax2d, self._on_rect_select, useblit=True, button=[3],
+            ax2d, self._on_rect_select, useblit=True, button=[1, 3],
             minspanx=5, minspany=5, spancoords="pixels",
             interactive=True,
             props=dict(facecolor="cyan", edgecolor="white",
@@ -1300,16 +1303,47 @@ class LunarExplorer:
     #  INTERACTION HANDLERS
     # ==================================================================
 
+    def _on_mouse_press(self, event):
+        """Track left-press location to distinguish click from drag."""
+        if event.button != 1:
+            self._press_xy = None
+            return
+        target_ax = self.ax
+        if target_ax is None or event.inaxes != target_ax:
+            self._press_xy = None
+            return
+        if self.toolbar.mode:
+            self._press_xy = None
+            return
+        if event.x is None or event.y is None:
+            self._press_xy = None
+            return
+        self._press_xy = (event.x, event.y)
+
     def _on_click(self, event):
-        """Left-click -> sample values or set profile points.
+        """Left-release -> sample values or set profile points.
         Implements the inverse mapping concept from Lecture 2.
         Part C adds slope, suitability readout and profile cross-sections."""
         if event.button != 1:
+            self._press_xy = None
             return
+        press_xy = self._press_xy
+        self._press_xy = None
+
         target_ax = self.ax
         if target_ax is None or event.inaxes != target_ax:
             return
         if self.toolbar.mode:
+            return
+        if event.x is None or event.y is None:
+            return
+        if press_xy is not None:
+            dx = event.x - press_xy[0]
+            dy = event.y - press_xy[1]
+            # Left-drag draws a zoom rectangle; avoid sampling on drag releases.
+            if (dx * dx + dy * dy) > 25:
+                return
+        if event.xdata is None or event.ydata is None:
             return
 
         x, y = event.xdata, event.ydata
