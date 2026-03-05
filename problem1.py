@@ -975,18 +975,19 @@ class LunarExplorer:
     def _overlay_slope(self, ax):
         """
         Overlay slope as a diverging colourmap highlighting dangerous areas.
-        Green = flat/safe, yellow = moderate, red = dangerously steep.
+        Dark blue = flat/safe, light neutral = threshold/moderate,
+        dark red = dangerously steep.
         """
         if not self.slope_on.get():
             return
         hm = self._cur_hm()
         slope_deg = self._compute_slope_grid()
         thresh = float(self.slope_thresh_var.get())
-        # Create a colourmap: green (safe) -> yellow (caution) -> red (danger)
+        # Diverging map with luminance contrast for readability under CVD.
         from matplotlib.colors import LinearSegmentedColormap
         slope_cmap = LinearSegmentedColormap.from_list(
             "slope_safety",
-            [(0, "green"), (0.5, "yellow"), (1.0, "red")])
+            [(0.0, "#2166ac"), (0.5, "#f7f7f7"), (1.0, "#b2182b")])
         ax.imshow(slope_deg, cmap=slope_cmap,
                   extent=hm.extent, origin="upper",
                   vmin=0, vmax=thresh * 2,
