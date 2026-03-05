@@ -247,7 +247,7 @@ class LunarExplorer:
 
         # -- state --
         self.scale_idx = 0
-        self.zoom_stack: list[tuple] = []
+        self.zoom_stack: list[tuple[int, tuple[float, float], tuple[float, float]]] = []
         self.cur_xlim = self.cur_ylim = None
         self._press_xy = None
 
@@ -258,7 +258,7 @@ class LunarExplorer:
         self._cached_slope = None
         self._cached_slope_idx = -1
         self._cached_suit = None
-        self._cached_suit_idx = -1
+        self._cached_suit_key = None
         self._pending_render_job = None
 
         # -- build UI & first render --
@@ -359,7 +359,7 @@ class LunarExplorer:
         self.contour_lw_var = tk.DoubleVar(value=0.5)
         ttk.Scale(frm, from_=0.2, to=3.0,
                   variable=self.contour_lw_var, orient=tk.HORIZONTAL,
-                  command=lambda _: self._render()).pack(fill=tk.X)
+                  command=lambda _: self._schedule_render()).pack(fill=tk.X)
 
         ttk.Label(frm, text="Line colour:").pack(anchor=tk.W, pady=(4, 0))
         self.contour_col_var = tk.StringVar(value="black")
@@ -427,7 +427,7 @@ class LunarExplorer:
         self.opacity_var = tk.DoubleVar(value=0.45)
         ttk.Scale(frm, from_=0.1, to=0.9, variable=self.opacity_var,
                   orient=tk.HORIZONTAL,
-                  command=lambda _: self._render()).pack(fill=tk.X)
+                  command=lambda _: self._schedule_render()).pack(fill=tk.X)
 
         ttk.Label(frm, text="Illumination cmap:").pack(anchor=tk.W, pady=(4, 0))
         self.illum_cmap_var = tk.StringVar(value="hot")
@@ -454,13 +454,13 @@ class LunarExplorer:
         self.slope_thresh_var = tk.DoubleVar(value=15.0)
         ttk.Scale(frm, from_=2, to=45,
                   variable=self.slope_thresh_var, orient=tk.HORIZONTAL,
-                  command=lambda _: self._render()).pack(fill=tk.X)
+                  command=lambda _: self._schedule_render()).pack(fill=tk.X)
 
         ttk.Label(frm, text="Slope opacity:").pack(anchor=tk.W, pady=(4, 0))
         self.slope_alpha_var = tk.DoubleVar(value=0.5)
         ttk.Scale(frm, from_=0.1, to=0.9,
                   variable=self.slope_alpha_var, orient=tk.HORIZONTAL,
-                  command=lambda _: self._render()).pack(fill=tk.X)
+                  command=lambda _: self._schedule_render()).pack(fill=tk.X)
 
         # -- C2: Permanently Shadowed Regions (PSR) indicators -------------
         frm = ttk.LabelFrame(parent,
@@ -477,7 +477,7 @@ class LunarExplorer:
         self.psr_thresh_var = tk.DoubleVar(value=10.0)
         ttk.Scale(frm, from_=1, to=40,
                   variable=self.psr_thresh_var, orient=tk.HORIZONTAL,
-                  command=lambda _: self._render()).pack(fill=tk.X)
+                  command=lambda _: self._schedule_render()).pack(fill=tk.X)
 
         # -- C3: Landing Suitability Score ---------------------------------
         frm = ttk.LabelFrame(parent,
@@ -495,28 +495,28 @@ class LunarExplorer:
         self.w_flat_var = tk.DoubleVar(value=0.4)
         ttk.Scale(frm, from_=0, to=1,
                   variable=self.w_flat_var, orient=tk.HORIZONTAL,
-                  command=lambda _: self._render()).pack(fill=tk.X)
+                  command=lambda _: self._schedule_render()).pack(fill=tk.X)
 
         ttk.Label(frm, text="Weight — illumination:").pack(
             anchor=tk.W, pady=(4, 0))
         self.w_illum_var = tk.DoubleVar(value=0.35)
         ttk.Scale(frm, from_=0, to=1,
                   variable=self.w_illum_var, orient=tk.HORIZONTAL,
-                  command=lambda _: self._render()).pack(fill=tk.X)
+                  command=lambda _: self._schedule_render()).pack(fill=tk.X)
 
         ttk.Label(frm, text="Weight — PSR proximity:").pack(
             anchor=tk.W, pady=(4, 0))
         self.w_psr_var = tk.DoubleVar(value=0.25)
         ttk.Scale(frm, from_=0, to=1,
                   variable=self.w_psr_var, orient=tk.HORIZONTAL,
-                  command=lambda _: self._render()).pack(fill=tk.X)
+                  command=lambda _: self._schedule_render()).pack(fill=tk.X)
 
         ttk.Label(frm, text="Suitability opacity:").pack(
             anchor=tk.W, pady=(4, 0))
         self.suit_alpha_var = tk.DoubleVar(value=0.55)
         ttk.Scale(frm, from_=0.1, to=0.9,
                   variable=self.suit_alpha_var, orient=tk.HORIZONTAL,
-                  command=lambda _: self._render()).pack(fill=tk.X)
+                  command=lambda _: self._schedule_render()).pack(fill=tk.X)
 
         # -- C4: Elevation Profile Cross-Section ---------------------------
         frm = ttk.LabelFrame(parent,
@@ -538,6 +538,7 @@ class LunarExplorer:
                        "  (or set profile pts)\n"
                        "Left-drag  -> zoom into region\n"
                        "Right-drag -> zoom into region\n"
+                       "Auto-scale follows zoom level\n"
                        "(2D view only)",
                   font=("Helvetica", 9), foreground="#555").pack(anchor=tk.W)
         ttk.Button(frm, text="Reset Zoom",
@@ -889,12 +890,13 @@ class LunarExplorer:
         h, w = data.shape
         xs = np.linspace(ext[0], ext[1], w)
         ys = np.linspace(ext[3], ext[2], h)
-        X, Y = np.meshgrid(xs, ys)
         step = max(1, min(h, w) // 800)
-        Xs, Ys, Ds = X[::step, ::step], Y[::step, ::step], data[::step, ::step]
+        xs_s = xs[::step]
+        ys_s = ys[::step]
+        Ds = data[::step, ::step]
         try:
             cs = ax.contour(
-                Xs, Ys, Ds, levels=levels,
+                xs_s, ys_s, Ds, levels=levels,
                 colors=self.contour_col_var.get(),
                 linewidths=float(self.contour_lw_var.get()),
                 alpha=0.6)
@@ -995,11 +997,12 @@ class LunarExplorer:
         ext = hm.extent
         xs = np.linspace(ext[0], ext[1], w)
         ys = np.linspace(ext[3], ext[2], h)
-        X, Y = np.meshgrid(xs, ys)
         step = max(1, min(h, w) // 600)
+        xs_s = xs[::step]
+        ys_s = ys[::step]
+        slope_s = slope_deg[::step, ::step]
         try:
-            ax.contour(X[::step, ::step], Y[::step, ::step],
-                       slope_deg[::step, ::step],
+            ax.contour(xs_s, ys_s, slope_s,
                        levels=[thresh], colors=["red"],
                        linewidths=1.2, linestyles="dashed", alpha=0.8)
         except Exception as exc:
@@ -1040,11 +1043,12 @@ class LunarExplorer:
         ext = il.extent
         xs = np.linspace(ext[0], ext[1], w)
         ys = np.linspace(ext[3], ext[2], h)
-        X, Y = np.meshgrid(xs, ys)
         step = max(1, min(h, w) // 600)
+        xs_s = xs[::step]
+        ys_s = ys[::step]
+        il_s = il_norm[::step, ::step]
         try:
-            ax.contour(X[::step, ::step], Y[::step, ::step],
-                       il_norm[::step, ::step],
+            ax.contour(xs_s, ys_s, il_s,
                        levels=[thresh_pct], colors=["dodgerblue"],
                        linewidths=1.0, linestyles="solid", alpha=0.9)
         except Exception as exc:
@@ -1063,8 +1067,18 @@ class LunarExplorer:
             for science, not too close for safety)
         """
         hm = self._cur_hm()
-        if (self._cached_suit is not None
-                and self._cached_suit_idx == self.scale_idx):
+        w_f = float(self.w_flat_var.get())
+        w_i = float(self.w_illum_var.get())
+        w_p = float(self.w_psr_var.get())
+        psr_thresh = float(self.psr_thresh_var.get()) / 100.0
+        cache_key = (
+            self.scale_idx,
+            round(w_f, 4),
+            round(w_i, 4),
+            round(w_p, 4),
+            round(psr_thresh, 4),
+        )
+        if self._cached_suit is not None and self._cached_suit_key == cache_key:
             return self._cached_suit
 
         # Flatness component (from slope)
@@ -1094,7 +1108,6 @@ class LunarExplorer:
         # PSR proximity component
         # Compute distance transform from PSR boundary: close to PSR
         # is scientifically valuable (water ice) but must not be *in* PSR
-        psr_thresh = float(self.psr_thresh_var.get()) / 100.0
         psr_mask = illum_score <= psr_thresh
         if np.any(psr_mask) and not np.all(psr_mask):
             dist_to_psr = ndimage.distance_transform_edt(~psr_mask)
@@ -1107,9 +1120,6 @@ class LunarExplorer:
             psr_prox = np.ones_like(hm.data) * 0.5
 
         # Weighted combination
-        w_f = float(self.w_flat_var.get())
-        w_i = float(self.w_illum_var.get())
-        w_p = float(self.w_psr_var.get())
         total_w = w_f + w_i + w_p
         if total_w < 1e-6:
             total_w = 1.0
@@ -1117,7 +1127,7 @@ class LunarExplorer:
         score = np.clip(score, 0, 1)
 
         self._cached_suit = score
-        self._cached_suit_idx = self.scale_idx
+        self._cached_suit_key = cache_key
         return score
 
     def _overlay_suitability(self, ax):
@@ -1127,9 +1137,6 @@ class LunarExplorer:
         """
         if not self.suit_on.get():
             return
-        # Invalidate cache — weights or PSR threshold may have changed
-        self._cached_suit = None
-        self._cached_suit_idx = -1
         hm = self._cur_hm()
         score = self._compute_suitability()
         ax.imshow(score, cmap="RdYlGn", vmin=0, vmax=1,
@@ -1299,6 +1306,91 @@ class LunarExplorer:
             ax3.set_ylabel("Y (px)", fontsize=8)
         ax3.set_zlabel(f"Elevation x{vexag:.1f} (m)", fontsize=8)
 
+    @staticmethod
+    def _extent_limits(ext):
+        x0, x1 = sorted((float(ext[0]), float(ext[1])))
+        y0, y1 = sorted((float(ext[2]), float(ext[3])))
+        return x0, x1, y0, y1
+
+    @classmethod
+    def _point_in_extent(cls, x, y, ext):
+        x0, x1, y0, y1 = cls._extent_limits(ext)
+        return (x0 <= x <= x1) and (y0 <= y <= y1)
+
+    @classmethod
+    def _clip_window_to_extent(cls, xlim, ylim, ext):
+        x0, x1, y0, y1 = cls._extent_limits(ext)
+        cx0 = min(max(min(xlim), x0), x1)
+        cx1 = min(max(max(xlim), x0), x1)
+        cy0 = min(max(min(ylim), y0), y1)
+        cy1 = min(max(max(ylim), y0), y1)
+        if cx1 <= cx0:
+            cx0, cx1 = x0, x1
+        if cy1 <= cy0:
+            cy0, cy1 = y0, y1
+        return (cx0, cx1), (cy0, cy1)
+
+    @classmethod
+    def _map_point_between_scales(cls, x, y, src_ds, dst_ds):
+        """Map a point from one dataset extent to another via normalised coords."""
+        sx0, sx1, sy0, sy1 = cls._extent_limits(src_ds.extent)
+        dx0, dx1, dy0, dy1 = cls._extent_limits(dst_ds.extent)
+        du = (sx1 - sx0) if abs(sx1 - sx0) > 1e-12 else 1.0
+        dv = (sy1 - sy0) if abs(sy1 - sy0) > 1e-12 else 1.0
+        u = (float(x) - sx0) / du
+        v = (float(y) - sy0) / dv
+        return dx0 + u * (dx1 - dx0), dy0 + v * (dy1 - dy0)
+
+    @classmethod
+    def _map_window_between_scales(cls, xlim, ylim, src_ds, dst_ds):
+        """Map a zoom window between scales when absolute coordinates are unavailable."""
+        if src_ds.bounds is not None and dst_ds.bounds is not None:
+            return tuple(sorted(xlim)), tuple(sorted(ylim))
+        x0, y0 = cls._map_point_between_scales(xlim[0], ylim[0], src_ds, dst_ds)
+        x1, y1 = cls._map_point_between_scales(xlim[1], ylim[1], src_ds, dst_ds)
+        return tuple(sorted((x0, x1))), tuple(sorted((y0, y1)))
+
+    def _select_scale_for_zoom(self, xlim, ylim):
+        """
+        Choose the dataset scale whose coverage best matches the selected box area.
+        Only considers scales that contain the zoom-box centre.
+        """
+        sel_area = abs((xlim[1] - xlim[0]) * (ylim[1] - ylim[0]))
+        if not np.isfinite(sel_area) or sel_area <= 0:
+            return self.scale_idx
+
+        cur_ds = self._cur_hm()
+        cx = 0.5 * (xlim[0] + xlim[1])
+        cy = 0.5 * (ylim[0] + ylim[1])
+
+        best_idx = self.scale_idx
+        best_score = float("inf")
+        for idx, ds in enumerate(self.store.heightmaps):
+            tx, ty = cx, cy
+            if not (cur_ds.bounds is not None and ds.bounds is not None):
+                tx, ty = self._map_point_between_scales(cx, cy, cur_ds, ds)
+            if not self._point_in_extent(tx, ty, ds.extent):
+                continue
+
+            area = max(float(ds.coverage_area), 1e-9)
+            score = abs(np.log(area / sel_area))
+            if idx == self.scale_idx:
+                score *= 0.98  # small hysteresis to avoid flicker near boundary
+            if score < best_score:
+                best_score = score
+                best_idx = idx
+
+        return best_idx
+
+    def _invalidate_scale_dependent_state(self):
+        """Clear caches/state that depend on active dataset scale."""
+        self._cached_slope = None
+        self._cached_slope_idx = -1
+        self._cached_suit = None
+        self._cached_suit_key = None
+        self.profile_pts.clear()
+        self._refresh_stats()
+
     # ==================================================================
     #  INTERACTION HANDLERS
     # ==================================================================
@@ -1419,13 +1511,27 @@ class LunarExplorer:
     def _on_rect_select(self, eclick, erelease):
         x1, y1 = eclick.xdata, eclick.ydata
         x2, y2 = erelease.xdata, erelease.ydata
-        if x1 is None or x2 is None:
+        if x1 is None or x2 is None or y1 is None or y2 is None:
             return
+        xlim = (min(x1, x2), max(x1, x2))
+        ylim = (min(y1, y2), max(y1, y2))
+
         if self.ax is not None:
             self.zoom_stack.append(
-                (self.ax.get_xlim(), self.ax.get_ylim()))
-        self.cur_xlim = (min(x1, x2), max(x1, x2))
-        self.cur_ylim = (min(y1, y2), max(y1, y2))
+                (self.scale_idx, self.ax.get_xlim(), self.ax.get_ylim()))
+
+        old_ds = self._cur_hm()
+        new_idx = self._select_scale_for_zoom(xlim, ylim)
+        if new_idx != self.scale_idx:
+            self.scale_idx = new_idx
+            self.scale_var.set(new_idx)
+            self._invalidate_scale_dependent_state()
+            new_ds = self._cur_hm()
+            xlim, ylim = self._map_window_between_scales(
+                xlim, ylim, old_ds, new_ds)
+
+        self.cur_xlim, self.cur_ylim = self._clip_window_to_extent(
+            xlim, ylim, self._cur_hm().extent)
         self._render()
 
     def _reset_zoom(self):
@@ -1435,7 +1541,14 @@ class LunarExplorer:
 
     def _zoom_back(self):
         if self.zoom_stack:
-            self.cur_xlim, self.cur_ylim = self.zoom_stack.pop()
+            item = self.zoom_stack.pop()
+            prev_idx, prev_xlim, prev_ylim = item
+            if prev_idx != self.scale_idx:
+                self.scale_idx = prev_idx
+                self.scale_var.set(prev_idx)
+                self._invalidate_scale_dependent_state()
+            self.cur_xlim, self.cur_ylim = self._clip_window_to_extent(
+                prev_xlim, prev_ylim, self._cur_hm().extent)
         else:
             self.cur_xlim = self.cur_ylim = None
         self._render()
@@ -1444,20 +1557,14 @@ class LunarExplorer:
         self.scale_idx = self.scale_var.get()
         self.zoom_stack.clear()
         self.cur_xlim = self.cur_ylim = None
-        # Invalidate Part C caches
-        self._cached_slope = None
-        self._cached_slope_idx = -1
-        self._cached_suit = None
-        self._cached_suit_idx = -1
-        self.profile_pts.clear()
-        self._refresh_stats()
+        self._invalidate_scale_dependent_state()
         self._render()
 
     def _on_interval_slide(self, _val):
         v = int(float(_val))
         self.interval_lbl.config(text=f"{v} m")
         if self.contour_on.get():
-            self._render()
+            self._schedule_render()
 
     def _on_3d_param(self, changed="view"):
         self.azi_lbl.config(text=f"{int(float(self.azi_var.get()))} deg")
