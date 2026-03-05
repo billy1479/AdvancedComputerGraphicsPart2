@@ -839,6 +839,8 @@ class LunarExplorer:
         self.cbar = self.fig.colorbar(
             self.im, ax=self.ax, label="Elevation (m)",
             shrink=0.82, pad=0.02, aspect=30)
+        self._draw_active_overlay_scales(
+            self.ax, start_pad=0.12, pad_step=0.08, shrink=0.9, aspect=45)
 
         # 7 -- rectangle selector for zoom (left/right drag)
         self.selector = RectangleSelector(
@@ -1000,12 +1002,14 @@ class LunarExplorer:
             fontsize=10, fontweight="bold")
         self._set_axis_labels_3d(ax3d, hm, vexag)
 
-        # shared colour bar
+        # shared elevation colour bar
         sm = matplotlib.cm.ScalarMappable(cmap=cmap, norm=norm)
         sm.set_array([])
         self.cbar = self.fig.colorbar(
             sm, ax=[ax2d, ax3d], label="Elevation (m)",
             shrink=0.7, pad=0.03, aspect=28)
+        self._draw_active_overlay_scales(
+            ax2d, start_pad=0.14, pad_step=0.08, shrink=0.85, aspect=42)
 
         # rectangle selector on the 2-D panel
         self.selector = RectangleSelector(
@@ -1295,6 +1299,99 @@ class LunarExplorer:
                   extent=hm.extent, origin="upper",
                   alpha=float(self.suit_alpha_var.get()),
                   aspect="equal")
+
+    def _draw_suitability_scale(self, ax, *, shrink=0.9, pad=0.12, aspect=45):
+        """Draw a horizontal legend bar below the map for suitability colours."""
+        if not self.suit_on.get():
+            return None
+        norm = mcolors.Normalize(vmin=0, vmax=1)
+        sm = matplotlib.cm.ScalarMappable(norm=norm, cmap="RdYlGn")
+        sm.set_array([])
+        cb = self.fig.colorbar(
+            sm, ax=ax, orientation="horizontal",
+            shrink=shrink, pad=pad, aspect=aspect)
+        cb.set_ticks([0.0, 0.5, 1.0])
+        cb.set_ticklabels(["Poor", "0.5", "Good"])
+        cb.set_label("Landing suitability score", fontsize=9, labelpad=4)
+        cb.ax.tick_params(labelsize=8, pad=2)
+        return cb
+
+    def _draw_illumination_scale(self, ax, *, shrink=0.9, pad=0.12, aspect=45):
+        if not self.illum_on.get():
+            return None
+        il = self._cur_il()
+        if il is None:
+            return None
+        sm = matplotlib.cm.ScalarMappable(
+            norm=mcolors.Normalize(vmin=0, vmax=1),
+            cmap=self.illum_cmap_var.get())
+        sm.set_array([])
+        cb = self.fig.colorbar(
+            sm, ax=ax, orientation="horizontal",
+            shrink=shrink, pad=pad, aspect=aspect)
+        cb.set_ticks([0.0, 0.5, 1.0])
+        cb.set_ticklabels(["Low", "0.5", "High"])
+        cb.set_label("Illumination (normalised)", fontsize=9, labelpad=4)
+        cb.ax.tick_params(labelsize=8, pad=2)
+        return cb
+
+    def _draw_slope_scale(self, ax, *, shrink=0.9, pad=0.12, aspect=45):
+        if not self.slope_on.get():
+            return None
+        thresh = float(self.slope_thresh_var.get())
+        from matplotlib.colors import LinearSegmentedColormap
+        slope_cmap = LinearSegmentedColormap.from_list(
+            "slope_safety",
+            [(0.0, "#2166ac"), (0.5, "#f7f7f7"), (1.0, "#b2182b")])
+        sm = matplotlib.cm.ScalarMappable(
+            norm=mcolors.Normalize(vmin=0, vmax=thresh * 2),
+            cmap=slope_cmap)
+        sm.set_array([])
+        cb = self.fig.colorbar(
+            sm, ax=ax, orientation="horizontal",
+            shrink=shrink, pad=pad, aspect=aspect)
+        cb.set_ticks([0.0, thresh, thresh * 2.0])
+        cb.set_ticklabels([f"0", f"{thresh:.0f}", f"{2*thresh:.0f}"])
+        cb.set_label("Slope (deg)", fontsize=9, labelpad=4)
+        cb.ax.tick_params(labelsize=8, pad=2)
+        return cb
+
+    def _draw_psr_scale(self, ax, *, shrink=0.9, pad=0.12, aspect=45):
+        if not self.psr_on.get():
+            return None
+        il = self._cur_il()
+        if il is None:
+            return None
+        thresh_pct = float(self.psr_thresh_var.get())
+        cmap = mcolors.ListedColormap(["#f3f8ff", "#1a27e6"])
+        norm = mcolors.BoundaryNorm([0.0, 0.5, 1.0], cmap.N)
+        sm = matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap)
+        sm.set_array([])
+        cb = self.fig.colorbar(
+            sm, ax=ax, orientation="horizontal",
+            shrink=shrink, pad=pad, aspect=aspect)
+        cb.set_ticks([0.25, 0.75])
+        cb.set_ticklabels(["Lit", "PSR"])
+        cb.set_label(
+            f"Shadow mask (illum <= {thresh_pct:.0f}%)",
+            fontsize=9, labelpad=4)
+        cb.ax.tick_params(labelsize=8, pad=2)
+        return cb
+
+    def _draw_active_overlay_scales(
+            self, ax, *, start_pad=0.12, pad_step=0.08, shrink=0.9, aspect=45):
+        """Draw horizontal bars under the map for all active thematic overlays."""
+        pad = start_pad
+        drawers = (
+            self._draw_illumination_scale,
+            self._draw_slope_scale,
+            self._draw_psr_scale,
+            self._draw_suitability_scale,
+        )
+        for draw in drawers:
+            cb = draw(ax, shrink=shrink, pad=pad, aspect=aspect)
+            if cb is not None:
+                pad += pad_step
 
     # -- C4: Elevation Profile Cross-Section ---------------------------
     def _draw_profile_on_map(self, ax):
