@@ -60,6 +60,15 @@ else:
     HAS_TIFFFILE = False
 
 LUNAR_RADIUS_KM = 1737.4
+# Local dataset investigation (2026-03-05) on bundled LDEM files:
+# - ldem_4.tif float32 range ~= -8.878 .. 10.504
+# - ldem_4_uint.tif / ldem_16_uint.tif uint16 range ~= 2k .. 41k DN
+# - Fitted relation on paired products: value_km = 0.0005 * DN - 10
+#   => elevation_m = (DN * 0.5) - 10000
+# Elevations are interpreted relative to the lunar reference sphere
+# of radius 1737.4 km (LROC convention).
+LDEM_UINT_SCALE_M = 0.5
+LDEM_UINT_OFFSET_M = -10000.0
 
 
 # ============================================================================
@@ -69,15 +78,23 @@ LUNAR_RADIUS_KM = 1737.4
 class LunarDataset:
     """One loaded TIFF: pixel array + spatial metadata."""
 
-    def __init__(self, filepath):
+    def __init__(self, filepath, role="unknown"):
         self.filepath = filepath
         self.name = os.path.basename(filepath)
+        self.role = role
         self.data = None
         self.width = self.height = 0
         self.bounds = None
         self.transform = None
         self.pixel_size = None
         self.scale_label = ""
+        self.raw_dtype = "unknown"
+        self.raw_min = float("nan")
+        self.raw_max = float("nan")
+        self.crs = None
+        self.is_georeferenced = False
+        self.georef_note = "No georeference metadata"
+        self.calibration_note = "No calibration applied"
         self._load()
 
     def _load(self):
@@ -87,32 +104,97 @@ class LunarDataset:
             self._load_tifffile()
         else:
             self._load_pil()
+        self._capture_raw_stats()
+        self._apply_height_calibration()
         self._clean()
 
     def _load_rasterio(self):
         with rasterio.open(self.filepath) as src:
-            self.data = src.read(1).astype(np.float64)
+            raw = src.read(1)
+            self.raw_dtype = str(raw.dtype)
+            self.data = raw.astype(np.float64)
             self.height, self.width = self.data.shape
-            self.bounds = src.bounds
             self.transform = src.transform
             nodata = src.nodata
             if nodata is not None:
                 self.data[self.data == nodata] = np.nan
-            self.pixel_size = abs(self.transform.a)
+            self.crs = str(src.crs) if src.crs else None
+            identity = rasterio.Affine.identity()
+            has_non_identity_transform = (
+                self.transform is not None and
+                any(abs(a - b) > 1e-12 for a, b in zip(self.transform, identity))
+            )
+            self.is_georeferenced = bool(self.crs) or has_non_identity_transform
+            if self.is_georeferenced:
+                self.bounds = src.bounds
+                self.pixel_size = abs(self.transform.a)
+                if self.crs:
+                    self.georef_note = f"GeoTIFF CRS: {self.crs}"
+                else:
+                    self.georef_note = "Affine transform present (CRS missing)"
+            else:
+                self.bounds = None
+                self.transform = None
+                self.pixel_size = None
+                self.georef_note = "No CRS/GeoTIFF transform metadata"
 
     def _load_tifffile(self):
         import tifffile
-        self.data = tifffile.imread(self.filepath).astype(np.float64)
+        with tifffile.TiffFile(self.filepath) as tf:
+            page = tf.pages[0]
+            try:
+                raw = page.asarray()
+            except Exception:
+                raw = np.array(PILImage.open(self.filepath))
+            self.raw_dtype = str(raw.dtype)
+            self.data = raw.astype(np.float64)
+            geo_tags = (33550, 33922, 34735, 34736, 34737)
+            self.is_georeferenced = any(code in page.tags for code in geo_tags)
+            if self.is_georeferenced:
+                self.georef_note = "GeoTIFF georeference tags present"
+            else:
+                self.georef_note = "No GeoTIFF georeference tags"
         if self.data.ndim == 3:
             self.data = self.data[:, :, 0]
         self.height, self.width = self.data.shape
 
     def _load_pil(self):
         img = PILImage.open(self.filepath)
-        self.data = np.array(img, dtype=np.float64)
+        raw = np.array(img)
+        self.raw_dtype = str(raw.dtype)
+        self.data = raw.astype(np.float64)
         if self.data.ndim == 3:
             self.data = self.data[:, :, 0]
         self.height, self.width = self.data.shape
+        self.georef_note = "No georeference metadata (PIL loader)"
+
+    def _capture_raw_stats(self):
+        vals = self.data[np.isfinite(self.data)]
+        if vals.size == 0:
+            return
+        self.raw_min = float(np.nanmin(vals))
+        self.raw_max = float(np.nanmax(vals))
+
+    def _apply_height_calibration(self):
+        if self.role != "heightmaps":
+            self.calibration_note = "N/A (illumination layer)"
+            return
+        try:
+            dtype = np.dtype(self.raw_dtype)
+        except Exception:
+            dtype = self.data.dtype
+        rmin, rmax = self.raw_min, self.raw_max
+        if np.issubdtype(dtype, np.unsignedinteger) and np.isfinite(rmax) and rmax > 1000:
+            self.data = self.data * LDEM_UINT_SCALE_M + LDEM_UINT_OFFSET_M
+            self.calibration_note = "DN->m: elev = DN*0.5 - 10000"
+            return
+        if (np.issubdtype(dtype, np.floating) and
+                np.isfinite(rmin) and np.isfinite(rmax) and
+                -50.0 <= rmin <= 50.0 and -50.0 <= rmax <= 50.0):
+            self.data = self.data * 1000.0
+            self.calibration_note = "km->m: elev = value*1000"
+            return
+        self.calibration_note = "Assumed metres (no conversion)"
 
     def _clean(self):
         if np.any(np.abs(self.data) > 1e15):
@@ -182,7 +264,7 @@ class DataStore:
     def _load_folder(self, subfolder, target):
         for fp in self._find_tiffs(subfolder):
             try:
-                target.append(LunarDataset(fp))
+                target.append(LunarDataset(fp, role=subfolder))
             except Exception as exc:
                 print(f"[WARN] Could not load {fp}: {exc}")
 
@@ -202,8 +284,10 @@ class DataStore:
             print(f"\n{tag}:")
             for ds in lst:
                 rng = f"{np.nanmin(ds.data):.1f} .. {np.nanmax(ds.data):.1f}"
+                raw_rng = f"{ds.raw_min:.1f} .. {ds.raw_max:.1f}"
                 print(f"  [{ds.scale_label}] {ds.name}  "
-                      f"{ds.width}x{ds.height}  range={rng}")
+                      f"{ds.width}x{ds.height}  raw={raw_rng} ({ds.raw_dtype})  "
+                      f"elev={rng}  [{ds.calibration_note}]")
         print("=" * 60)
 
 
@@ -304,15 +388,44 @@ class LunarExplorer:
         ttk.Label(parent, text="Artemis III - Map Controls",
                   font=("Helvetica", 13, "bold")).pack(pady=(10, 2), padx=8)
 
-        # -- View Mode (Part B: comparison toggle) -------------------------
-        frm = ttk.LabelFrame(parent, text="View Mode", padding=5)
+        # -- Navigation ----------------------------------------------------
+        frm = ttk.LabelFrame(parent, text="Navigation", padding=5)
         frm.pack(fill=tk.X, **PAD)
+
+        ttk.Label(frm,
+                  text="Left-click  -> sample values\n"
+                       "  (or set profile pts)\n"
+                       "Left-drag  -> zoom into region\n"
+                       "Right-drag -> zoom into region\n"
+                       "Auto-scale follows zoom level\n"
+                       "(2D view only)",
+                  font=("Helvetica", 9), foreground="#555").pack(anchor=tk.W)
+        ttk.Button(frm, text="Reset Zoom",
+                   command=self._reset_zoom).pack(fill=tk.X, pady=(5, 2))
+        ttk.Button(frm, text="<- Zoom Back",
+                   command=self._zoom_back).pack(fill=tk.X, pady=2)
+
+        # -- View Mode (Part B: comparison toggle) -------------------------
+        self.frame_view_mode = ttk.LabelFrame(parent, text="View Mode", padding=5)
+        self.frame_view_mode.pack(fill=tk.X, **PAD)
+        frm = self.frame_view_mode
 
         self.view_var = tk.StringVar(value=self.VIEW_MODES[0])
         for mode in self.VIEW_MODES:
             ttk.Radiobutton(frm, text=mode, variable=self.view_var,
-                            value=mode, command=self._render
+                            value=mode, command=self._on_view_mode_change
                             ).pack(anchor=tk.W, pady=1)
+
+        # -- Sampled-value readout -----------------------------------------
+        self.frame_sample = ttk.LabelFrame(parent, text="Sampled Point", padding=5)
+        self.sample_text = tk.Text(self.frame_sample, height=10, width=32,
+                                   font=("Courier", 9), state=tk.DISABLED,
+                                   bg="#f5f5f0", relief=tk.FLAT)
+        self.sample_text.pack(fill=tk.X)
+        ttk.Button(self.frame_sample, text="Reset Selection",
+                   command=self._on_reset_sample_selection
+                   ).pack(fill=tk.X, pady=(4, 0))
+        self._hide_sample_panel()
 
         # -- Spatial Scale -------------------------------------------------
         frm = ttk.LabelFrame(parent, text="Spatial Scale", padding=5)
@@ -374,8 +487,10 @@ class LunarExplorer:
                         command=self._render).pack(anchor=tk.W, pady=(3, 0))
 
         # -- 3-D Displacement-Map controls (Part B) ------------------------
-        frm = ttk.LabelFrame(parent, text="3D Displacement Map", padding=5)
-        frm.pack(fill=tk.X, **PAD)
+        self.frame_3d_controls = ttk.LabelFrame(
+            parent, text="3D Displacement Map", padding=5)
+        self.frame_3d_controls.pack(fill=tk.X, **PAD)
+        frm = self.frame_3d_controls
 
         ttk.Label(frm, text="Azimuth (deg):").pack(anchor=tk.W)
         self.azi_var = tk.IntVar(value=-135)
@@ -415,8 +530,10 @@ class LunarExplorer:
                         command=self._render).pack(anchor=tk.W, pady=(1, 0))
 
         # -- Illumination overlay ------------------------------------------
-        frm = ttk.LabelFrame(parent, text="Illumination Overlay", padding=5)
-        frm.pack(fill=tk.X, **PAD)
+        self.frame_illumination = ttk.LabelFrame(
+            parent, text="Illumination Overlay", padding=5)
+        self.frame_illumination.pack(fill=tk.X, **PAD)
+        frm = self.frame_illumination
 
         self.illum_on = tk.BooleanVar(value=False)
         ttk.Checkbutton(frm, text="Show illumination layer",
@@ -529,41 +646,16 @@ class LunarExplorer:
         ttk.Button(frm, text="Clear Profile",
                    command=self._clear_profile).pack(fill=tk.X, pady=(4, 0))
 
-        # -- Navigation ----------------------------------------------------
-        frm = ttk.LabelFrame(parent, text="Navigation", padding=5)
-        frm.pack(fill=tk.X, **PAD)
-
-        ttk.Label(frm,
-                  text="Left-click  -> sample values\n"
-                       "  (or set profile pts)\n"
-                       "Left-drag  -> zoom into region\n"
-                       "Right-drag -> zoom into region\n"
-                       "Auto-scale follows zoom level\n"
-                       "(2D view only)",
-                  font=("Helvetica", 9), foreground="#555").pack(anchor=tk.W)
-        ttk.Button(frm, text="Reset Zoom",
-                   command=self._reset_zoom).pack(fill=tk.X, pady=(5, 2))
-        ttk.Button(frm, text="<- Zoom Back",
-                   command=self._zoom_back).pack(fill=tk.X, pady=2)
-
-        # -- Sampled-value readout -----------------------------------------
-        frm = ttk.LabelFrame(parent, text="Sampled Point", padding=5)
-        frm.pack(fill=tk.X, **PAD)
-
-        self.sample_text = tk.Text(frm, height=10, width=32,
-                                   font=("Courier", 9), state=tk.DISABLED,
-                                   bg="#f5f5f0", relief=tk.FLAT)
-        self.sample_text.pack(fill=tk.X)
-
         # -- Dataset statistics --------------------------------------------
         frm = ttk.LabelFrame(parent, text="Current Dataset Stats", padding=5)
         frm.pack(fill=tk.X, **PAD)
 
-        self.stats_text = tk.Text(frm, height=5, width=32,
+        self.stats_text = tk.Text(frm, height=10, width=32,
                                   font=("Courier", 9), state=tk.DISABLED,
                                   bg="#f5f5f0", relief=tk.FLAT)
         self.stats_text.pack(fill=tk.X)
         self._refresh_stats()
+        self._update_3d_controls_visibility()
 
     # -- MAP CANVAS --------------------------------------------------------
     def _build_map(self, parent):
@@ -597,7 +689,66 @@ class LunarExplorer:
             return self.store.illumination[idx]
         return None
 
+    def _on_view_mode_change(self):
+        self._update_3d_controls_visibility()
+        self._render()
+
+    def _show_sample_panel(self):
+        if not hasattr(self, "frame_sample"):
+            return
+        if self.frame_sample.winfo_manager():
+            return
+        if hasattr(self, "frame_view_mode"):
+            self.frame_sample.pack(
+                fill=tk.X, padx=8, pady=3, before=self.frame_view_mode)
+        else:
+            self.frame_sample.pack(fill=tk.X, padx=8, pady=3)
+
+    def _hide_sample_panel(self):
+        if hasattr(self, "frame_sample") and self.frame_sample.winfo_manager():
+            self.frame_sample.pack_forget()
+
+    def _remove_sample_marker(self):
+        """Remove existing sampled-point marker(s) from visible 2D axes."""
+        axes = []
+        if self.ax is not None:
+            axes = [self.ax]
+        elif hasattr(self, "fig") and self.fig is not None:
+            axes = list(self.fig.axes)
+        removed = False
+        for ax in axes:
+            for art in list(a for a in ax.get_children()
+                            if getattr(a, "_sample_marker", False)):
+                art.remove()
+                removed = True
+        if removed and hasattr(self, "canvas") and self.canvas is not None:
+            self.canvas.draw_idle()
+
+    def _clear_sample_selection(self, remove_marker=False):
+        if hasattr(self, "sample_text"):
+            self._set_textbox(self.sample_text, "")
+        self._hide_sample_panel()
+        if remove_marker:
+            self._remove_sample_marker()
+
+    def _on_reset_sample_selection(self):
+        self._clear_sample_selection(remove_marker=True)
+
+    def _update_3d_controls_visibility(self):
+        """Show 3D-specific controls only in pure 3D mode."""
+        if not hasattr(self, "frame_3d_controls"):
+            return
+        show = self.view_var.get() == self.VIEW_MODES[1]
+        is_visible = bool(self.frame_3d_controls.winfo_manager())
+        if show and not is_visible:
+            self.frame_3d_controls.pack(
+                fill=tk.X, padx=8, pady=3, before=self.frame_illumination)
+        elif not show and is_visible:
+            self.frame_3d_controls.pack_forget()
+
     def _render(self, *_):
+        self._clear_sample_selection()
+        self._update_3d_controls_visibility()
         # Clear any queued render to avoid duplicate redraws.
         if self._pending_render_job is not None:
             try:
@@ -1443,6 +1594,7 @@ class LunarExplorer:
 
         # -- Profile mode: collect two points, then show cross-section --
         if self.profile_mode.get():
+            self._clear_sample_selection()
             self.profile_pts.append((x, y))
             if len(self.profile_pts) > 2:
                 self.profile_pts = self.profile_pts[-2:]
@@ -1500,6 +1652,7 @@ class LunarExplorer:
             pass
 
         self._set_textbox(self.sample_text, "\n".join(lines))
+        self._show_sample_panel()
 
         # draw cross-hair marker
         for art in list(a for a in target_ax.get_children()
@@ -1590,12 +1743,17 @@ class LunarExplorer:
         lines = [
             f"File : {hm.name}",
             f"Size : {hm.width} x {hm.height} px",
+            f"Geo  : {hm.georef_note}",
+            f"Raw  : {hm.raw_dtype} {hm.raw_min:.1f}..{hm.raw_max:.1f}",
+            f"Cal  : {hm.calibration_note}",
             f"Elev : {np.nanmin(d):.0f} .. {np.nanmax(d):.0f} m",
             f"Mean : {np.nanmean(d):.0f} m",
             f"Std  : {np.nanstd(d):.0f} m",
         ]
         if hm.pixel_size is not None:
             lines.append(f"Res  : {hm.pixel_size:.1f} m/px")
+        if hm.role == "heightmaps":
+            lines.append(f"Datum: sphere R={LUNAR_RADIUS_KM:.1f} km")
         self._set_textbox(self.stats_text, "\n".join(lines))
 
     @staticmethod
