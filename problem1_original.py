@@ -39,8 +39,6 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 from matplotlib.widgets import RectangleSelector
 import matplotlib.colors as mcolors
-import matplotlib.lines as mlines      # proxy artists for geometric legend
-import matplotlib.patches as mpatches  # proxy artists for hatch legend
 from mpl_toolkits.mplot3d import Axes3D          # 3-D displacement plots
 from scipy import ndimage                         # Part C: slope / gradient
 
@@ -549,9 +547,9 @@ class LunarExplorer:
                   command=lambda _: self._schedule_render()).pack(fill=tk.X)
 
         ttk.Label(frm, text="Illumination cmap:").pack(anchor=tk.W, pady=(4, 0))
-        self.illum_cmap_var = tk.StringVar(value="gray_r")
+        self.illum_cmap_var = tk.StringVar(value="hot")
         ttk.Combobox(frm, textvariable=self.illum_cmap_var,
-                     values=["gray_r", "gray"],
+                     values=["hot", "YlOrRd", "magma", "inferno", "gray_r"],
                      state="readonly", width=14).pack(fill=tk.X)
 
         # ==============================================================
@@ -568,11 +566,17 @@ class LunarExplorer:
                         variable=self.slope_on,
                         command=self._render).pack(anchor=tk.W)
 
-        ttk.Label(frm, text="Danger threshold (deg):\n(orange dotted = 2/3 threshold,\n red dashed = danger threshold)").pack(
+        ttk.Label(frm, text="Danger threshold (deg):").pack(
             anchor=tk.W, pady=(4, 0))
         self.slope_thresh_var = tk.DoubleVar(value=15.0)
         ttk.Scale(frm, from_=2, to=45,
                   variable=self.slope_thresh_var, orient=tk.HORIZONTAL,
+                  command=lambda _: self._schedule_render()).pack(fill=tk.X)
+
+        ttk.Label(frm, text="Slope opacity:").pack(anchor=tk.W, pady=(4, 0))
+        self.slope_alpha_var = tk.DoubleVar(value=0.5)
+        ttk.Scale(frm, from_=0.1, to=0.9,
+                  variable=self.slope_alpha_var, orient=tk.HORIZONTAL,
                   command=lambda _: self._schedule_render()).pack(fill=tk.X)
 
         # -- C2: Permanently Shadowed Regions (PSR) indicators -------------
@@ -1125,19 +1129,26 @@ class LunarExplorer:
 
     def _overlay_slope(self, ax):
         """
-        Overlay slope using contour lines only, keeping the texture/geometry
-        channel separate from the elevation hue colourmap.
-        - Orange dotted line  = moderate warning (2/3 of danger threshold)
-        - Red dashed line     = danger threshold
-        No colour fill is applied, so the elevation colourmap beneath
-        remains fully readable (inverse mapping is preserved).
+        Overlay slope as a diverging colourmap highlighting dangerous areas.
+        Dark blue = flat/safe, light neutral = threshold/moderate,
+        dark red = dangerously steep.
         """
         if not self.slope_on.get():
             return
         hm = self._cur_hm()
         slope_deg = self._compute_slope_grid()
         thresh = float(self.slope_thresh_var.get())
-        moderate = thresh * (2.0 / 3.0)
+        # Diverging map with luminance contrast for readability under CVD.
+        from matplotlib.colors import LinearSegmentedColormap
+        slope_cmap = LinearSegmentedColormap.from_list(
+            "slope_safety",
+            [(0.0, "#2166ac"), (0.5, "#f7f7f7"), (1.0, "#b2182b")])
+        ax.imshow(slope_deg, cmap=slope_cmap,
+                  extent=hm.extent, origin="upper",
+                  vmin=0, vmax=thresh * 2,
+                  alpha=float(self.slope_alpha_var.get()),
+                  aspect="equal")
+        # Add a contour at the danger threshold
         h, w = slope_deg.shape
         ext = hm.extent
         xs = np.linspace(ext[0], ext[1], w)
@@ -1148,13 +1159,10 @@ class LunarExplorer:
         slope_s = slope_deg[::step, ::step]
         try:
             ax.contour(xs_s, ys_s, slope_s,
-                       levels=[moderate], colors=["orange"],
-                       linewidths=1.0, linestyles="dotted", alpha=0.9)
-            ax.contour(xs_s, ys_s, slope_s,
                        levels=[thresh], colors=["red"],
-                       linewidths=1.5, linestyles="dashed", alpha=0.95)
+                       linewidths=1.2, linestyles="dashed", alpha=0.8)
         except Exception as exc:
-            print(f"[WARN] Slope contour overlay failed: {exc}",
+            print(f"[WARN] Slope threshold contour failed: {exc}",
                   file=sys.stderr)
 
     # -- C2: Permanently Shadowed Regions (PSR) indicators -------------
@@ -1178,8 +1186,15 @@ class LunarExplorer:
         thresh_pct = float(self.psr_thresh_var.get()) / 100.0
         psr_mask = il_norm <= thresh_pct
 
-        # Draw PSR regions as hatching (texture channel) rather than a
-        # colour fill, so the elevation hue colourmap beneath stays readable.
+        # Draw as a blue-tinted semi-transparent overlay
+        psr_rgba = np.zeros((*psr_mask.shape, 4), dtype=np.float64)
+        psr_rgba[psr_mask, 0] = 0.1    # R
+        psr_rgba[psr_mask, 1] = 0.15   # G
+        psr_rgba[psr_mask, 2] = 0.9    # B
+        psr_rgba[psr_mask, 3] = 0.4    # A
+        ax.imshow(psr_rgba, extent=il.extent, origin="upper", aspect="equal")
+
+        # Add contour boundary around PSR regions
         h, w = il_norm.shape
         ext = il.extent
         xs = np.linspace(ext[0], ext[1], w)
@@ -1189,24 +1204,11 @@ class LunarExplorer:
         ys_s = ys[::step]
         il_s = il_norm[::step, ::step]
         try:
-            cf = ax.contourf(xs_s, ys_s, il_s,
-                             levels=[0.0, thresh_pct],
-                             hatches=["///"], colors=["none"])
-            # Matplotlib 3.10 removed QuadContourSet.collections; style
-            # whichever API the current version exposes.
-            if hasattr(cf, "collections"):
-                for collection in cf.collections:
-                    collection.set_edgecolor("dodgerblue")
-                    collection.set_linewidth(0.4)
-            else:
-                cf.set_edgecolor("dodgerblue")
-                cf.set_linewidth(0.4)
-            # Solid boundary contour around PSR region
             ax.contour(xs_s, ys_s, il_s,
                        levels=[thresh_pct], colors=["dodgerblue"],
-                       linewidths=1.2, linestyles="solid", alpha=0.95)
+                       linewidths=1.0, linestyles="solid", alpha=0.9)
         except Exception as exc:
-            print(f"[WARN] PSR hatch overlay failed: {exc}",
+            print(f"[WARN] PSR boundary contour failed: {exc}",
                   file=sys.stderr)
 
     # -- C3: Landing Suitability Score ---------------------------------
@@ -1334,66 +1336,62 @@ class LunarExplorer:
         return cb
 
     def _draw_slope_scale(self, ax, *, shrink=0.9, pad=0.12, aspect=45):
-        # Slope is now expressed as contour lines, not a colour fill.
-        # Legend is handled by _draw_geometric_legend.
-        return None
+        if not self.slope_on.get():
+            return None
+        thresh = float(self.slope_thresh_var.get())
+        from matplotlib.colors import LinearSegmentedColormap
+        slope_cmap = LinearSegmentedColormap.from_list(
+            "slope_safety",
+            [(0.0, "#2166ac"), (0.5, "#f7f7f7"), (1.0, "#b2182b")])
+        sm = matplotlib.cm.ScalarMappable(
+            norm=mcolors.Normalize(vmin=0, vmax=thresh * 2),
+            cmap=slope_cmap)
+        sm.set_array([])
+        cb = self.fig.colorbar(
+            sm, ax=ax, orientation="horizontal",
+            shrink=shrink, pad=pad, aspect=aspect)
+        cb.set_ticks([0.0, thresh, thresh * 2.0])
+        cb.set_ticklabels([f"0", f"{thresh:.0f}", f"{2*thresh:.0f}"])
+        cb.set_label("Slope (deg)", fontsize=9, labelpad=4)
+        cb.ax.tick_params(labelsize=8, pad=2)
+        return cb
 
     def _draw_psr_scale(self, ax, *, shrink=0.9, pad=0.12, aspect=45):
-        # PSR is now expressed as hatching, not a colour fill.
-        # Legend is handled by _draw_geometric_legend.
-        return None
+        if not self.psr_on.get():
+            return None
+        il = self._cur_il()
+        if il is None:
+            return None
+        thresh_pct = float(self.psr_thresh_var.get())
+        cmap = mcolors.ListedColormap(["#f3f8ff", "#1a27e6"])
+        norm = mcolors.BoundaryNorm([0.0, 0.5, 1.0], cmap.N)
+        sm = matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap)
+        sm.set_array([])
+        cb = self.fig.colorbar(
+            sm, ax=ax, orientation="horizontal",
+            shrink=shrink, pad=pad, aspect=aspect)
+        cb.set_ticks([0.25, 0.75])
+        cb.set_ticklabels(["Lit", "PSR"])
+        cb.set_label(
+            f"Shadow mask (illum <= {thresh_pct:.0f}%)",
+            fontsize=9, labelpad=4)
+        cb.ax.tick_params(labelsize=8, pad=2)
+        return cb
 
     def _draw_active_overlay_scales(
             self, ax, *, start_pad=0.12, pad_step=0.08, shrink=0.9, aspect=45):
-        """
-        Draw legends for all active overlays, split by visual channel.
-
-        Continuous overlays (illumination, suitability) retain horizontal
-        colorbars beneath the map — their value ranges are meaningful to the
-        user and benefit from a graduated scale.
-
-        Geometric/texture overlays (slope contours, PSR hatching) use a
-        figure legend with proxy artists instead.  A colourbar would be
-        misleading here because no colour fill is applied.
-        """
+        """Draw horizontal bars under the map for all active thematic overlays."""
         pad = start_pad
-        for draw in (self._draw_illumination_scale, self._draw_suitability_scale):
+        drawers = (
+            self._draw_illumination_scale,
+            self._draw_slope_scale,
+            self._draw_psr_scale,
+            self._draw_suitability_scale,
+        )
+        for draw in drawers:
             cb = draw(ax, shrink=shrink, pad=pad, aspect=aspect)
             if cb is not None:
                 pad += pad_step
-        self._draw_geometric_legend(ax)
-
-    def _draw_geometric_legend(self, ax):
-        """
-        Consolidated figure legend for overlays that use lines or hatching
-        rather than colour fills.  Uses proxy artists so the legend entries
-        accurately represent the visual encoding on the map.
-        """
-        handles = []
-
-        if self.slope_on.get():
-            thresh = float(self.slope_thresh_var.get())
-            moderate = thresh * (2.0 / 3.0)
-            handles.append(mlines.Line2D(
-                [], [], color="orange", linewidth=1.2, linestyle="dotted",
-                label=f"Slope moderate (>{moderate:.0f}°)"))
-            handles.append(mlines.Line2D(
-                [], [], color="red", linewidth=1.8, linestyle="dashed",
-                label=f"Slope danger (>{thresh:.0f}°)"))
-
-        if self.psr_on.get() and self._cur_il() is not None:
-            thresh_pct = float(self.psr_thresh_var.get())
-            handles.append(mpatches.Patch(
-                facecolor="none", edgecolor="dodgerblue",
-                hatch="///", linewidth=0.5,
-                label=f"PSR — illum ≤ {thresh_pct:.0f}%"))
-
-        if handles:
-            ax.legend(
-                handles=handles, loc="lower left",
-                fontsize=8, framealpha=0.88,
-                fancybox=True, borderpad=0.7,
-                title="Geometric overlays", title_fontsize=8)
 
     # -- C4: Elevation Profile Cross-Section ---------------------------
     def _draw_profile_on_map(self, ax):
