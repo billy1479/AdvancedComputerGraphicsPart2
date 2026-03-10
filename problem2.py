@@ -52,6 +52,7 @@ import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+from matplotlib.widgets import RectangleSelector
 from matplotlib.patches import FancyArrowPatch, Rectangle, FancyBboxPatch
 from matplotlib.colors import LinearSegmentedColormap
 import matplotlib.patheffects as pe
@@ -426,10 +427,15 @@ def compute_psr_mask(illum: np.ndarray, threshold: float = 0.05) -> np.ndarray:
     """
     Boolean PSR mask: pixels whose time-averaged illumination fraction
     falls below `threshold` are classified as permanently shadowed.
-    The illumination GeoTIFF stores raw digital numbers; for the purpose
-    of PSR detection we normalise to [0, 1].
+
+    Uses 2nd–98th percentile normalisation instead of nanmin/nanmax so that
+    zero-valued nodata rows at LROC polar image borders are NOT classified as
+    PSR.  With nanmin, the border zeros anchor the minimum, making entire
+    rows at the image edge pass the threshold and appear as horizontal bars.
     """
-    norm = (illum - np.nanmin(illum)) / (np.nanmax(illum) - np.nanmin(illum) + 1e-9)
+    lo = np.nanpercentile(illum, 2)
+    hi = np.nanpercentile(illum, 98)
+    norm = np.clip((illum - lo) / (hi - lo + 1e-9), 0.0, 1.0)
     return norm < threshold
 
 
@@ -459,8 +465,9 @@ def compute_suitability(elev: np.ndarray,
             zy = elev.shape[0] / illum.shape[0]
             zx = elev.shape[1] / illum.shape[1]
             illum = zoom(illum, (zy, zx), order=1)
-        norm_illum = (illum - np.nanmin(illum)) / (
-            np.nanmax(illum) - np.nanmin(illum) + 1e-9)
+        lo = np.nanpercentile(illum, 2)
+        hi = np.nanpercentile(illum, 98)
+        norm_illum = np.clip((illum - lo) / (hi - lo + 1e-9), 0.0, 1.0)
         illum_score = norm_illum
     else:
         illum_score = np.ones((h, w), dtype=np.float32)
@@ -528,6 +535,16 @@ class ArtemisInfoVis:
         self._illum_threshold = tk.DoubleVar(value=0.05)
         self._cache: dict = {}
         self._click_info = ""
+        # zoom state
+        self._zoom_stack: list = []
+        self._cur_xlim = None
+        self._cur_ylim = None
+        # click-marker state
+        self._click_col = None
+        self._click_row = None
+        # drag detection
+        self._press_xy = None
+        self._selector = None
 
         self._build_ui()
         self._refresh_chapter()
@@ -588,7 +605,8 @@ class ArtemisInfoVis:
 
         self._canvas = FigureCanvasTkAgg(self._fig, master=left)
         self._canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        self._canvas.mpl_connect("button_press_event", self._on_map_click)
+        self._canvas.mpl_connect("button_press_event", self._on_press)
+        self._canvas.mpl_connect("button_release_event", self._on_map_click)
 
         # ── right: narrative panel ───────────────────────────────────────────
         right = tk.Frame(pane, bg=BG_PANEL, width=320)
@@ -634,16 +652,10 @@ class ArtemisInfoVis:
         self._txt_body.pack(fill=tk.BOTH, expand=True)
         scroll.config(command=self._txt_body.yview)
 
-        # "You clicked" status
-        tk.Frame(right, bg=ACCENT, height=1).pack(fill=tk.X, padx=16, pady=2)
-        self._lbl_click = tk.Label(right, text="Click the map to explore",
-                                    bg=BG_PANEL, fg=FG_DIM,
-                                    font=("Segoe UI", 8, "italic"),
-                                    wraplength=295, justify=tk.LEFT)
-        self._lbl_click.pack(padx=8, pady=6, anchor=tk.W)
+        # Bottom-right click readout is created in _build_bottom_bar().
 
     def _build_bottom_bar(self):
-        bar = tk.Frame(self.root, bg=BG_CARD, height=72)
+        bar = tk.Frame(self.root, bg=BG_CARD, height=98)
         bar.pack(fill=tk.X, side=tk.BOTTOM, padx=0, pady=0)
         bar.pack_propagate(False)
 
@@ -718,13 +730,47 @@ class ArtemisInfoVis:
                  command=lambda _: self._refresh_chapter()
                  ).grid(row=1, column=5, padx=4)
 
-        # Right: status indicator
+        # Right: status + interaction controls + click info (bottom-right)
         status = tk.Frame(bar, bg=BG_CARD)
-        status.pack(side=tk.RIGHT, padx=12)
-        self._lbl_status = tk.Label(status, text="Loading…",
-                                     bg=BG_CARD, fg=FG_DIM,
-                                     font=("Segoe UI", 8, "italic"))
-        self._lbl_status.pack()
+        status.pack(side=tk.RIGHT, padx=12, pady=4, anchor=tk.E)
+
+        self._lbl_status = tk.Label(
+            status, text="Loading...",
+            bg=BG_CARD, fg=FG_DIM,
+            font=("Segoe UI", 8, "italic"),
+            justify=tk.RIGHT, anchor=tk.E
+        )
+        self._lbl_status.pack(anchor=tk.E)
+
+        action_row = tk.Frame(status, bg=BG_CARD)
+        action_row.pack(anchor=tk.E, pady=(4, 2))
+
+        tk.Button(
+            action_row, text="Reset Zoom",
+            command=self._reset_zoom,
+            bg=BG_PANEL, fg=FG_WHITE,
+            activebackground=ACCENT, activeforeground=BG_DARK,
+            font=("Segoe UI", 8, "bold"),
+            relief=tk.FLAT, bd=0, padx=8, pady=3, cursor="hand2"
+        ).pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Button(
+            action_row, text="Clear Marker",
+            command=self._clear_marker,
+            bg=BG_PANEL, fg=FG_WHITE,
+            activebackground=ACCENT, activeforeground=BG_DARK,
+            font=("Segoe UI", 8, "bold"),
+            relief=tk.FLAT, bd=0, padx=8, pady=3, cursor="hand2"
+        ).pack(side=tk.LEFT)
+
+        self._lbl_click = tk.Label(
+            status,
+            text="Click map to explore data values",
+            bg=BG_CARD, fg=FG_DIM,
+            font=("Segoe UI", 8, "italic"),
+            wraplength=420, justify=tk.RIGHT, anchor=tk.E
+        )
+        self._lbl_click.pack(anchor=tk.E, fill=tk.X)
 
     # ── chapter switching ─────────────────────────────────────────────────────
 
@@ -757,8 +803,16 @@ class ArtemisInfoVis:
         self._txt_body.insert(tk.END, ch["body"])
         self._txt_body.configure(state=tk.DISABLED)
 
+        # ── rebuild axes cleanly ──────────────────────────────────────────────
+        # ax.clear() leaves colourbar axes behind as orphaned figure axes.
+        # Delete every axes on the figure and create a fresh one each time.
+        for _a in self._fig.axes[:]:
+            self._fig.delaxes(_a)
+        self._ax = self._fig.add_subplot(111)
+        self._fig.subplots_adjust(left=0.04, right=0.93, top=0.93, bottom=0.07)
+        self._ax.set_facecolor("#05050f")
+
         # ── draw the map ──
-        self._ax.clear()
         key = ch["key"]
         if key == "landscape":
             self._draw_landscape()
@@ -768,6 +822,34 @@ class ArtemisInfoVis:
             self._draw_sunlight()
         elif key == "suitability":
             self._draw_suitability()
+
+        # ── restore zoom window ───────────────────────────────────────────────
+        if self._cur_xlim is not None:
+            self._ax.set_xlim(self._cur_xlim)
+            self._ax.set_ylim(self._cur_ylim)
+
+        # ── draw click marker ─────────────────────────────────────────────────
+        # Red crosshair + hollow circle; redrawn after every refresh so it
+        # persists across chapter switches and zoom changes.
+        if self._click_col is not None and self._click_row is not None:
+            kw = dict(linestyle="none", zorder=10, transform=self._ax.transData)
+            self._ax.plot(self._click_col, self._click_row,
+                          "+", color="#ff3355", markersize=22,
+                          markeredgewidth=2.5, **kw)
+            self._ax.plot(self._click_col, self._click_row,
+                          "o", color="none", markersize=16,
+                          markeredgecolor="#ff3355", markeredgewidth=1.8, **kw)
+
+        # ── attach drag-to-zoom rectangle selector ────────────────────────────
+        # Must be re-attached after every axes rebuild.
+        self._selector = RectangleSelector(
+            self._ax, self._on_rect_select,
+            useblit=True, button=[1],
+            minspanx=5, minspany=5, spancoords="pixels",
+            interactive=True,
+            props=dict(facecolor="cyan", edgecolor="white",
+                       alpha=0.15, linewidth=1.2)
+        )
 
         # ── status bar ──
         hm = self._current_heightmap()
@@ -916,7 +998,7 @@ class ArtemisInfoVis:
         import matplotlib.cm as cm
         norm_e = (elev - vmin) / (vmax - vmin + 1e-9)
         norm_e = np.clip(norm_e, 0, 1)
-        rgba   = cm.get_cmap("terrain")(norm_e)       # (H,W,4)
+        rgba   = matplotlib.colormaps["terrain"](norm_e)       # (H,W,4)
         # multiply RGB channels by hillshade for shading
         rgba[..., :3] *= hs[..., np.newaxis] * 0.6 + 0.4
         rgba[..., 3]   = 1.0
@@ -944,20 +1026,56 @@ class ArtemisInfoVis:
         Add callout arrows to key geographic features.
         Lecture 8: "Highlight to focus attention" — annotations direct
         the audience to the most important data features.
+
+        Data-driven detection: restrict argmin/argmax search to the inner
+        80% of the image (10% margin each side) so that nodata-zero border
+        pixels — which calibrate to extreme values after DN×0.5−10000 —
+        do not mis-locate the labels.  A light Gaussian smooth (σ = W/60)
+        finds basin/ridge centres rather than single-pixel spikes.
+        The actual calibrated elevation (km) is shown in each label.
         """
         ax, H, W = self._ax, elev.shape[0], elev.shape[1]
-        # Deep crater callout (roughly bottom-left quadrant)
+
+        # Search only the inner 80 % to skip nodata borders
+        mr, mc = max(1, H // 10), max(1, W // 10)
+        inner = elev[mr:H - mr, mc:W - mc].astype(np.float64)
+        inner = np.where(np.isfinite(inner), inner, np.nanmedian(inner))
+        smooth = ndimage.gaussian_filter(inner, sigma=max(H, W) / 60.0)
+
+        min_ri, min_ci = np.unravel_index(np.argmin(smooth), smooth.shape)
+        max_ri, max_ci = np.unravel_index(np.argmax(smooth), smooth.shape)
+
+        # Translate inner-array indices back to full-image coordinates
+        min_r, min_c = min_ri + mr, min_ci + mc
+        max_r, max_c = max_ri + mr, max_ci + mc
+
+        # True calibrated elevation at the detected pixel
+        min_e_m = float(elev[min_r, min_c])
+        max_e_m = float(elev[max_r, max_c])
+
+        def label_pos(r, c, dist=0.24):
+            """Push label away from image centre to avoid obscuring arrowhead."""
+            cx2, cy2 = W / 2.0, H / 2.0
+            dx, dy = c - cx2, r - cy2
+            length = max((dx**2 + dy**2)**0.5, 1.0)
+            tx = c + dist * W * dx / length
+            ty = r + dist * H * dy / length
+            return (float(np.clip(tx, W * 0.06, W * 0.92)),
+                    float(np.clip(ty, H * 0.06, H * 0.92)))
+
+        tx, ty = label_pos(min_r, min_c)
         ax.annotate(
-            "Deep crater\n(cold trap for ice)",
-            xy=(W * 0.25, H * 0.72), xytext=(W * 0.08, H * 0.88),
+            f"Deep crater floor\n(cold trap for ice)\n{min_e_m / 1000:+.2f} km",
+            xy=(min_c, min_r), xytext=(tx, ty),
             arrowprops=dict(arrowstyle="->", color=ACCENT, lw=1.2),
             color=ACCENT, fontsize=7.5, ha="center",
             bbox=dict(boxstyle="round,pad=0.3", fc="#00000088", ec=ACCENT, lw=0.8)
         )
-        # High ridge callout
+
+        tx2, ty2 = label_pos(max_r, max_c)
         ax.annotate(
-            "Sunlit ridge\n(solar power peak)",
-            xy=(W * 0.55, H * 0.22), xytext=(W * 0.72, H * 0.08),
+            f"Highest ridge\n(solar power peak)\n{max_e_m / 1000:+.2f} km",
+            xy=(max_c, max_r), xytext=(tx2, ty2),
             arrowprops=dict(arrowstyle="->", color=GOLD, lw=1.2),
             color=GOLD, fontsize=7.5, ha="center",
             bbox=dict(boxstyle="round,pad=0.3", fc="#00000088", ec=GOLD, lw=0.8)
@@ -994,8 +1112,9 @@ class ArtemisInfoVis:
             return
 
         H, W = illum.shape
-        norm_illum = (illum - np.nanmin(illum)) / (
-            np.nanmax(illum) - np.nanmin(illum) + 1e-9)
+        lo = np.nanpercentile(illum, 2)
+        hi = np.nanpercentile(illum, 98)
+        norm_illum = np.clip((illum - lo) / (hi - lo + 1e-9), 0.0, 1.0)
 
         im = self._ax.imshow(norm_illum * 100.0, cmap="plasma",
                               vmin=0, vmax=100,
@@ -1017,9 +1136,20 @@ class ArtemisInfoVis:
         self._common_axis_style("Light & Shadow — Where the Sun Never Shines")
 
         if self._show_annotations.get():
+            # Find darkest (PSR centre) and brightest (peak of eternal light)
+            # using inner-80% search to skip nodata borders
+            blurred = ndimage.gaussian_filter(norm_illum, sigma=max(H, W) / 40)
+            mr, mc = max(1, H // 10), max(1, W // 10)
+            inner = blurred[mr:H - mr, mc:W - mc]
+            dr, dc = np.unravel_index(np.argmin(inner), inner.shape)
+            br, bc = np.unravel_index(np.argmax(inner), inner.shape)
+            dr += mr; dc += mc; br += mr; bc += mc
+
             self._ax.annotate(
                 "Permanently\nShadowed Region\n(water ice!)",
-                xy=(W * 0.3, H * 0.68), xytext=(W * 0.06, H * 0.80),
+                xy=(dc, dr),
+                xytext=(float(np.clip(dc + W * 0.20, W * 0.05, W * 0.88)),
+                        float(np.clip(dr + H * 0.14, H * 0.05, H * 0.88))),
                 arrowprops=dict(arrowstyle="->", color="#80c8ff", lw=1.2),
                 color="#80c8ff", fontsize=7.5, ha="center",
                 bbox=dict(boxstyle="round,pad=0.3", fc="#00000099",
@@ -1027,7 +1157,9 @@ class ArtemisInfoVis:
             )
             self._ax.annotate(
                 "Peak of\nEternal Light",
-                xy=(W * 0.58, H * 0.18), xytext=(W * 0.74, H * 0.06),
+                xy=(bc, br),
+                xytext=(float(np.clip(bc - W * 0.18, W * 0.05, W * 0.88)),
+                        float(np.clip(br + H * 0.14, H * 0.05, H * 0.88))),
                 arrowprops=dict(arrowstyle="->", color=GOLD, lw=1.2),
                 color=GOLD, fontsize=7.5, ha="center",
                 bbox=dict(boxstyle="round,pad=0.3", fc="#00000099",
@@ -1035,12 +1167,12 @@ class ArtemisInfoVis:
             )
             import matplotlib.patches as mpatches
             psr_patch = mpatches.Patch(color="#1565c0", alpha=0.6,
-                                        label="PSR (< shadow threshold)")
+                                        label="Permanently Shadowed Region (PSR)")
             self._ax.legend(handles=[psr_patch], loc="lower right",
                              facecolor=BG_CARD, edgecolor=FG_DIM,
                              labelcolor=FG_WHITE, fontsize=7.5)
             self._ax.text(0.02, 0.02,
-                          f"PSR threshold: illumination < {self._illum_threshold.get()*100:.0f}%"
+                          f"Shadow threshold: illumination < {self._illum_threshold.get()*100:.0f}%"
                           "  |  Colourmap: plasma (perceptually uniform, Lec 7)",
                           transform=self._ax.transAxes,
                           color=FG_DIM, fontsize=6.5, va="bottom")
@@ -1071,17 +1203,21 @@ class ArtemisInfoVis:
                          interpolation="bilinear", alpha=0.8)
 
         if illum is not None:
-            norm_illum = (illum - np.nanmin(illum)) / (
-                np.nanmax(illum) - np.nanmin(illum) + 1e-9)
+            lo = np.nanpercentile(illum, 2)
+            hi = np.nanpercentile(illum, 98)
+            norm_illum = np.clip((illum - lo) / (hi - lo + 1e-9), 0.0, 1.0)
             # illum is already (H, W) — same as hs, so overlay aligns correctly
             self._ax.imshow(norm_illum * 100.0, cmap="YlOrRd",
                              vmin=0, vmax=100, alpha=0.55,
                              origin="upper", aspect="auto",
                              interpolation="bilinear")
 
-            # Isoline contours at 20 / 40 / 60 / 80 % (Lec 4: contouring)
+            # Smooth before contouring to avoid tracing LROC scan-line artefacts
+            # as horizontal bars (Lec 4: isolines trace field features, not noise)
+            smooth_illum = ndimage.gaussian_filter(norm_illum * 100.0,
+                                                   sigma=max(H, W) / 40.0)
             lvls = [20, 40, 60, 80]
-            ct = self._ax.contour(norm_illum * 100.0, levels=lvls,
+            ct = self._ax.contour(smooth_illum, levels=lvls,
                                    colors=[ACCENT, ACCENT, GOLD, GOLD],
                                    linewidths=[0.7, 0.7, 0.9, 0.9], alpha=0.85)
             self._ax.clabel(ct, inline=True, fontsize=6,
@@ -1109,14 +1245,22 @@ class ArtemisInfoVis:
         self._common_axis_style("Sunlight & Power — Peaks of Eternal Light")
 
         if self._show_annotations.get():
-            self._ax.annotate(
-                "Best solar panel\nsite (>60% sunlit)",
-                xy=(W * 0.55, H * 0.2), xytext=(W * 0.36, H * 0.06),
-                arrowprops=dict(arrowstyle="->", color=GOLD, lw=1.2),
-                color=GOLD, fontsize=7.5, ha="center",
-                bbox=dict(boxstyle="round,pad=0.3", fc="#00000099",
-                          ec=GOLD, lw=0.8)
-            )
+            if illum is not None:
+                blurred = ndimage.gaussian_filter(norm_illum, sigma=max(H, W) / 40)
+                mr, mc = max(1, H // 10), max(1, W // 10)
+                inner = blurred[mr:H - mr, mc:W - mc]
+                br, bc = np.unravel_index(np.argmax(inner), inner.shape)
+                br += mr; bc += mc
+                self._ax.annotate(
+                    "Best solar panel\nsite (>60% sunlit)",
+                    xy=(bc, br),
+                    xytext=(float(np.clip(bc - W * 0.18, W * 0.05, W * 0.88)),
+                            float(np.clip(br + H * 0.14, H * 0.05, H * 0.88))),
+                    arrowprops=dict(arrowstyle="->", color=GOLD, lw=1.2),
+                    color=GOLD, fontsize=7.5, ha="center",
+                    bbox=dict(boxstyle="round,pad=0.3", fc="#00000099",
+                              ec=GOLD, lw=0.8)
+                )
             self._ax.text(0.02, 0.02,
                           "Isolines: 20/40/60/80% illumination (Lec 4: contouring)  "
                           "|  Overlay: YlOrRd (intuitive warm=bright)",
@@ -1206,42 +1350,115 @@ class ArtemisInfoVis:
 
     # ── interactivity ─────────────────────────────────────────────────────────
 
+    # ── zoom & marker helpers ─────────────────────────────────────────────────
+
+    def _on_press(self, event):
+        """Record mouse-down pixel so we can distinguish a click from a drag."""
+        if event.inaxes == self._ax:
+            self._press_xy = (event.x, event.y)
+        else:
+            self._press_xy = None
+
+    def _on_rect_select(self, eclick, erelease):
+        """
+        RectangleSelector callback — drag-to-zoom.
+        Pushes the current view limits onto the undo stack, then applies
+        the dragged rectangle as the new view window.
+        (Lec 2: interactive view navigation / inverse mapping)
+        """
+        x1, y1 = eclick.xdata, eclick.ydata
+        x2, y2 = erelease.xdata, erelease.ydata
+        if None in (x1, x2, y1, y2):
+            return
+        self._zoom_stack.append((self._cur_xlim, self._cur_ylim))
+        self._cur_xlim = (min(x1, x2), max(x1, x2))
+        # imshow y-axis is inverted (row 0 = top); preserve that orientation
+        self._cur_ylim = (max(y1, y2), min(y1, y2))
+        self._refresh_chapter()
+
+    def _zoom_back(self):
+        """Step back one zoom level."""
+        if self._zoom_stack:
+            self._cur_xlim, self._cur_ylim = self._zoom_stack.pop()
+        else:
+            self._cur_xlim = self._cur_ylim = None
+        self._refresh_chapter()
+
+    def _reset_zoom(self):
+        """Clear zoom history and return to the full-image view."""
+        self._zoom_stack.clear()
+        self._cur_xlim = self._cur_ylim = None
+        self._refresh_chapter()
+
+    def _clear_marker(self):
+        """Remove the click marker and reset the info readout."""
+        self._click_col = None
+        self._click_row = None
+        self._lbl_click.configure(
+            text="Click the map to explore data values", fg=FG_DIM)
+        self._refresh_chapter()
+
     def _on_map_click(self, event):
         """
-        Click-to-explore: shows data values at the clicked pixel.
+        Click-to-explore: shows data values at the clicked pixel and places
+        a persistent marker on the map.
         Implements "inverse mapping" (Lec 2) — click pixel → data value.
+        Drag-vs-click detection: ignore release events where the mouse moved
+        more than 5 px since button_press (those belong to the zoom selector).
         """
+        if event.button != 1:
+            self._press_xy = None
+            return
+        # Ignore drag releases
+        if self._press_xy is not None:
+            dx = event.x - self._press_xy[0]
+            dy = event.y - self._press_xy[1]
+            self._press_xy = None
+            if dx * dx + dy * dy > 25:
+                return
+        else:
+            return
         if event.inaxes != self._ax or event.xdata is None:
             return
+
         col = int(round(event.xdata))
         row = int(round(event.ydata))
-        ch  = CHAPTERS[self._chapter_idx]
+        # Store position — marker is drawn in _refresh_chapter so it
+        # survives chapter switches and zoom changes
+        self._click_col = col
+        self._click_row = row
+        ch = CHAPTERS[self._chapter_idx]
 
-        lines = [f"📍 Pixel  col={col}, row={row}"]
+        lines = [f"Pixel  col={col}, row={row}"]
 
         hm = self._current_heightmap()
         if hm is not None and 0 <= row < hm.height and 0 <= col < hm.width:
             elev_val = float(hm.data[row, col])
-            lines.append(f"  Elevation: {elev_val:+.0f} m")
+            lines.append(f"  Elevation: {elev_val:+.0f} m  ({elev_val/1000:+.2f} km)")
 
-        il = self._current_illumination()
-        if il is not None and 0 <= row < il.height and 0 <= col < il.width:
-            raw_val   = float(il.data[row, col])
-            norm_val  = (raw_val - float(np.nanmin(il.data))) / (
-                float(np.nanmax(il.data)) - float(np.nanmin(il.data)) + 1e-9)
+        illum = self._get_illum_aligned()
+        if illum is not None and 0 <= row < illum.shape[0] and 0 <= col < illum.shape[1]:
+            raw_val = float(illum[row, col])
+            lo = float(np.nanpercentile(illum, 2))
+            hi = float(np.nanpercentile(illum, 98))
+            norm_val = float(np.clip((raw_val - lo) / (hi - lo + 1e-9), 0, 1))
             lines.append(f"  Illuminated: {norm_val*100:.1f}%")
             psr_mask = self._get_psr_mask()
-            if psr_mask is not None and psr_mask.shape == il.data.shape:
-                lines.append(f"  In PSR: {'Yes ❄' if psr_mask[row, col] else 'No ☀'}")
+            if psr_mask is not None and 0 <= row < psr_mask.shape[0] and 0 <= col < psr_mask.shape[1]:
+                in_psr = bool(psr_mask[row, col])
+                lines.append(f"  In shadowed region: {'Yes' if in_psr else 'No'}")
 
         if ch["key"] == "suitability":
             suit = self._get_suitability()
             if 0 <= row < suit.shape[0] and 0 <= col < suit.shape[1]:
                 sv = float(suit[row, col])
-                lines.append(f"  Suitability: {sv:.2f}  ({'Ideal' if sv > 0.7 else 'Caution' if sv > 0.4 else 'Avoid'})")
+                lines.append(
+                    f"  Suitability: {sv:.2f}  "
+                    f"({'Ideal' if sv > 0.7 else 'Caution' if sv > 0.4 else 'Avoid'})"
+                )
 
-        msg = "\n".join(lines)
-        self._lbl_click.configure(text=msg, fg=ACCENT)
+        self._lbl_click.configure(text="\n".join(lines), fg=ACCENT)
+        self._refresh_chapter()  # redraws marker at stored position
 
     def _on_scale_change(self, event):
         if not self.store.heightmaps:
