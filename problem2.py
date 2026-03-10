@@ -1,4 +1,4 @@
-"""
+﻿"""
 COMP4097 – Problem 2: Infographic Visualisation for a General Audience
 Artemis III: Exploring the Lunar South Pole
 
@@ -731,8 +731,11 @@ class ArtemisInfoVis:
                  ).grid(row=1, column=5, padx=4)
 
         # Right: status + interaction controls + click info (bottom-right)
-        status = tk.Frame(bar, bg=BG_CARD)
-        status.pack(side=tk.RIGHT, padx=12, pady=4, anchor=tk.E)
+        self._status_panel = tk.Frame(bar, bg=BG_CARD, width=520)
+        self._status_panel.pack(side=tk.RIGHT, padx=12, pady=4, anchor=tk.E,
+                                fill=tk.Y)
+        self._status_panel.pack_propagate(False)
+        status = self._status_panel
 
         self._lbl_status = tk.Label(
             status, text="Loading...",
@@ -768,9 +771,21 @@ class ArtemisInfoVis:
             text="Click map to explore data values",
             bg=BG_CARD, fg=FG_DIM,
             font=("Segoe UI", 8, "italic"),
-            wraplength=420, justify=tk.RIGHT, anchor=tk.E
+            wraplength=500, justify=tk.RIGHT, anchor=tk.E
         )
         self._lbl_click.pack(anchor=tk.E, fill=tk.X)
+
+        bar.bind("<Configure>", self._on_bottom_bar_resize)
+        self.root.after_idle(self._on_bottom_bar_resize)
+
+    def _on_bottom_bar_resize(self, event=None):
+        """Resize the bottom-right info panel and keep text wrapping in sync."""
+        if not hasattr(self, "_status_panel") or not hasattr(self, "_lbl_click"):
+            return
+        bar_width = event.width if event is not None else self.root.winfo_width()
+        panel_width = max(380, min(780, int(bar_width * 0.44)))
+        self._status_panel.configure(width=panel_width)
+        self._lbl_click.configure(wraplength=max(280, panel_width - 16))
 
     # ── chapter switching ─────────────────────────────────────────────────────
 
