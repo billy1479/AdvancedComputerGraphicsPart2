@@ -52,6 +52,7 @@ from matplotlib.gridspec import GridSpec
 from matplotlib.widgets import RectangleSelector
 from matplotlib.patches import FancyBboxPatch, Wedge, FancyArrowPatch
 from matplotlib.colors import Normalize, LinearSegmentedColormap
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 import matplotlib.patheffects as pe
 import matplotlib.cm as mcm
 from scipy import ndimage
@@ -479,12 +480,17 @@ def style_axis_dark(ax, title="", xlabel="", ylabel="", title_size=9):
         spine.set_linewidth(0.4)
 
 
-def style_colorbar(cbar, label=""):
+def style_colorbar(cbar, label="", horizontal=False):
     """Dark-themed colorbar."""
     cbar.set_label(label, color=FG_WHITE, fontsize=7.5)
-    cbar.ax.yaxis.set_tick_params(color=FG_DIM, labelsize=6.5)
-    for lbl in cbar.ax.get_yticklabels():
-        lbl.set_color(FG_DIM)
+    if horizontal:
+        cbar.ax.xaxis.set_tick_params(color=FG_DIM, labelsize=6.5)
+        for lbl in cbar.ax.get_xticklabels():
+            lbl.set_color(FG_DIM)
+    else:
+        cbar.ax.yaxis.set_tick_params(color=FG_DIM, labelsize=6.5)
+        for lbl in cbar.ax.get_yticklabels():
+            lbl.set_color(FG_DIM)
 
 
 def big_stat(ax, value, unit, description, color=ACCENT):
@@ -625,6 +631,35 @@ class ArtemisInfoVis:
             width_ratios=CHAPTER_WIDTH_RATIOS,
             **CHAPTER_LAYOUT
         )
+
+    def _add_horizontal_map_colorbar(self, ax_map, mappable, label,
+                                     ticks=None, ticklabels=None):
+        """
+        Add a horizontal scale bar directly under the map, spanning map width.
+        """
+        divider = make_axes_locatable(ax_map)
+        cax = divider.append_axes("bottom", size="4.5%", pad=0.36)
+        cbar = self._fig.colorbar(mappable, cax=cax, orientation="horizontal")
+        if ticks is not None:
+            cbar.set_ticks(ticks)
+        if ticklabels is not None:
+            cbar.set_ticklabels(ticklabels)
+        style_colorbar(cbar, label, horizontal=True)
+        cax.set_facecolor(BG_PLOT)
+        for spine in cax.spines.values():
+            spine.set_edgecolor(FG_MUTED)
+            spine.set_linewidth(0.4)
+        return cbar
+
+    @staticmethod
+    def _keep_ylabels_inside(ax, fontsize=5.8):
+        """
+        Keep y tick labels within narrow info charts so they don't spill onto map.
+        """
+        ax.tick_params(axis="y", pad=-2, labelsize=fontsize)
+        for lbl in ax.get_yticklabels():
+            lbl.set_horizontalalignment("left")
+            lbl.set_clip_on(True)
 
     def _build_title_bar(self):
         """Title banner — first visual element seen (Lec 8: reading order)."""
@@ -1008,9 +1043,7 @@ class ArtemisInfoVis:
         sm = mcm.ScalarMappable(cmap="terrain",
                                 norm=Normalize(vmin=vmin, vmax=vmax))
         sm.set_array([])
-        cbar = self._fig.colorbar(sm, ax=ax_map, fraction=0.03, pad=0.02,
-                                   aspect=30)
-        style_colorbar(cbar, "Elevation (m)")
+        self._add_horizontal_map_colorbar(ax_map, sm, "Elevation (m)")
         style_axis_dark(ax_map, "Terrain Map (Hillshaded)",
                          "West \u2190 East (px)", "South \u2190 North (px)",
                          title_size=10)
@@ -1021,14 +1054,38 @@ class ArtemisInfoVis:
         # ── histogram: elevation distribution (InfoVis) ───────────────────
         ax_hist = self._fig.add_subplot(gs[0, 1])
         valid = elev[np.isfinite(elev)].ravel()
-        bins = np.linspace(vmin, vmax, 50)
-        ax_hist.hist(valid, bins=bins, color=ACCENT, alpha=0.85,
-                     edgecolor=BG_PLOT, linewidth=0.3)
+        band_edges = np.linspace(vmin, vmax, 7)  # wider bins for readable labels
+        counts, edges = np.histogram(valid, bins=band_edges)
+        centers = (edges[:-1] + edges[1:]) / 2
+        widths = np.diff(edges) * 0.86
+        bars = ax_hist.bar(
+            centers, counts, width=widths, align="center",
+            color=ACCENT, alpha=0.85, edgecolor=BG_PLOT, linewidth=0.35)
+
+        # Put bin labels directly on bars to avoid axis-label overflow.
+        total = max(valid.size, 1)
+        for bar, lo, hi, c in zip(bars, edges[:-1], edges[1:], counts):
+            if c <= 0:
+                continue
+            label = (
+                f"{lo/1000:+.1f}→{hi/1000:+.1f} km\n"
+                f"{(c/total)*100:.1f}%"
+            )
+            y = max(c * 0.55, 1)
+            t = ax_hist.text(
+                bar.get_x() + bar.get_width() / 2, y, label,
+                ha="center", va="center", fontsize=5.2, color=FG_WHITE,
+                zorder=6, clip_on=True)
+            t.set_path_effects([
+                pe.withStroke(linewidth=1.6, foreground="#000000bb")
+            ])
+
         ax_hist.axvline(0, color=GOLD, ls="--", lw=0.8, label="Sea level equiv.")
         ax_hist.legend(fontsize=5.5, facecolor=BG_CARD, edgecolor=FG_DIM,
                        labelcolor=FG_WHITE, loc="upper right")
+        ax_hist.set_xticks([])
         style_axis_dark(ax_hist, "Elevation Distribution",
-                         "Elevation (m)", "Pixel count")
+                         "", "Pixel count")
 
         # ── comparison bar: Moon vs Earth (Infographic) ───────────────────
         ax_comp = self._fig.add_subplot(gs[1, 1])
@@ -1047,8 +1104,9 @@ class ArtemisInfoVis:
         for bar, v in zip(bars, vals):
             ax_comp.text(bar.get_width() + 150, bar.get_y() + bar.get_height()/2,
                          f"{v:,.0f} m", va="center", fontsize=6, color=FG_WHITE)
-        style_axis_dark(ax_comp, "How Extreme Is It?  (vs Earth)",
+        style_axis_dark(ax_comp, "How Extreme Is It?\n(vs Earth)",
                          "Metres", "")
+        self._keep_ylabels_inside(ax_comp, fontsize=5.4)
         ax_comp.invert_yaxis()
 
         # ── key statistics strip (Infographic) ────────────────────────────
@@ -1130,9 +1188,8 @@ class ArtemisInfoVis:
             im = ax_map.imshow(norm_ill * 100, cmap="plasma",
                                vmin=0, vmax=100, origin="upper",
                                aspect="equal", interpolation="bilinear")
-            cbar = self._fig.colorbar(im, ax=ax_map, fraction=0.03, pad=0.02,
-                                       aspect=30)
-            style_colorbar(cbar, "% Time Illuminated")
+            self._add_horizontal_map_colorbar(
+                ax_map, im, "% Time Illuminated")
 
             if self._show_psr.get():
                 psr = self._get_psr_mask()
@@ -1191,8 +1248,9 @@ class ArtemisInfoVis:
         ax_bar.set_yticklabels(categories, fontsize=6)
         ax_bar.legend(fontsize=5.5, facecolor=BG_CARD, edgecolor=FG_DIM,
                       labelcolor=FG_WHITE, loc="lower right")
-        style_axis_dark(ax_bar, "Shadow vs Sunlight: Conditions",
+        style_axis_dark(ax_bar, "Shadow vs Sunlight\nConditions",
                          "Relative score", "")
+        self._keep_ylabels_inside(ax_bar, fontsize=5.4)
         ax_bar.invert_yaxis()
 
         # ── key stats ─────────────────────────────────────────────────────
@@ -1282,9 +1340,8 @@ class ArtemisInfoVis:
             sm = mcm.ScalarMappable(cmap="YlOrRd",
                                     norm=Normalize(vmin=0, vmax=100))
             sm.set_array([])
-            cbar = self._fig.colorbar(sm, ax=ax_map, fraction=0.03, pad=0.02,
-                                       aspect=30)
-            style_colorbar(cbar, "% Time Illuminated")
+            self._add_horizontal_map_colorbar(
+                ax_map, sm, "% Time Illuminated")
 
             if self._show_psr.get():
                 psr = self._get_psr_mask()
@@ -1330,8 +1387,9 @@ class ArtemisInfoVis:
                 ax_bands.text(c + valid.size * 0.02, i,
                               f"{pct:.1f}%", va="center",
                               fontsize=5.5, color=FG_WHITE)
-        style_axis_dark(ax_bands, "Illumination Band Distribution",
+        style_axis_dark(ax_bands, "Illumination Band\nDistribution",
                          "Pixel count", "")
+        self._keep_ylabels_inside(ax_bands, fontsize=5.5)
         ax_bands.invert_yaxis()
 
         # ── cross-section profile (InfoVis: filtering/slicing, Lec 2) ─────
@@ -1409,11 +1467,9 @@ class ArtemisInfoVis:
         im = ax_map.imshow(suit, cmap="RdYlGn", vmin=0, vmax=1,
                            alpha=0.8, origin="upper", aspect="equal",
                            interpolation="bilinear")
-        cbar = self._fig.colorbar(im, ax=ax_map, fraction=0.03, pad=0.02,
-                                   aspect=30)
-        cbar.set_ticks([0, 0.5, 1])
-        cbar.set_ticklabels(["Avoid", "Caution", "Ideal"])
-        style_colorbar(cbar, "Landing Suitability")
+        self._add_horizontal_map_colorbar(
+            ax_map, im, "Landing Suitability",
+            ticks=[0, 0.5, 1], ticklabels=["Avoid", "Caution", "Ideal"])
 
         # Highlight top 5%
         threshold = float(np.nanpercentile(suit, 95))
