@@ -92,6 +92,17 @@ PSR_CLR   = "#1565c0"
 WARM_ORG  = "#ff9800"
 IS_MACOS  = (sys.platform == "darwin")
 
+# Chapter panel layout: keep chart/stat columns compact to maximise map area.
+CHAPTER_WIDTH_RATIOS = [4.6, 1.25, 0.62, 0.62]
+CHAPTER_LAYOUT = {
+    "hspace": 0.32,
+    "wspace": 0.16,
+    "left": 0.03,
+    "right": 0.985,
+    "top": 0.92,
+    "bottom": 0.07,
+}
+
 # ── chapter definitions ─────────────────────────────────────────────────────
 CHAPTERS = [
     {
@@ -544,8 +555,11 @@ class ArtemisInfoVis:
         self._click_row = None
         self._press_xy  = None
         self._selector  = None
+        self._click_marker_artists = []
         # main map axes reference (for zoom/click)
         self._map_ax    = None
+        self._base_xlim = None
+        self._base_ylim = None
 
         self._build_ui()
         self._refresh_chapter()
@@ -572,6 +586,45 @@ class ArtemisInfoVis:
             "highlightcolor": bg_color,
             "highlightthickness": 0,
         }
+
+    def _clear_click_marker_artists(self):
+        for artist in self._click_marker_artists:
+            try:
+                artist.remove()
+            except ValueError:
+                pass
+        self._click_marker_artists = []
+
+    def _draw_click_marker(self):
+        self._clear_click_marker_artists()
+        if self._map_ax is None or self._click_col is None or self._click_row is None:
+            return
+        m1 = self._map_ax.plot(self._click_col, self._click_row,
+                               "+", color="#ff3355", markersize=18,
+                               markeredgewidth=2.5, zorder=10)[0]
+        m2 = self._map_ax.plot(self._click_col, self._click_row,
+                               "o", color="none", markersize=14,
+                               markeredgecolor="#ff3355", markeredgewidth=1.5,
+                               zorder=10)[0]
+        self._click_marker_artists = [m1, m2]
+
+    def _apply_zoom_to_map(self):
+        if self._map_ax is None:
+            return
+        if self._cur_xlim is not None and self._cur_ylim is not None:
+            self._map_ax.set_xlim(self._cur_xlim)
+            self._map_ax.set_ylim(self._cur_ylim)
+            return
+        if self._base_xlim is not None and self._base_ylim is not None:
+            self._map_ax.set_xlim(self._base_xlim)
+            self._map_ax.set_ylim(self._base_ylim)
+
+    def _chapter_gridspec(self):
+        return GridSpec(
+            2, 4, figure=self._fig,
+            width_ratios=CHAPTER_WIDTH_RATIOS,
+            **CHAPTER_LAYOUT
+        )
 
     def _build_title_bar(self):
         """Title banner — first visual element seen (Lec 8: reading order)."""
@@ -749,6 +802,7 @@ class ArtemisInfoVis:
         self._chapter_idx = idx
         self._zoom_stack.clear()
         self._cur_xlim = self._cur_ylim = None
+        self._base_xlim = self._base_ylim = None
         self._click_col = self._click_row = None
         self._refresh_chapter()
 
@@ -785,6 +839,9 @@ class ArtemisInfoVis:
 
         # Rebuild figure
         self._fig.clf()
+        self._selector = None
+        self._map_ax = None
+        self._click_marker_artists = []
         key = ch["key"]
         if key == "landscape":
             self._draw_landscape()
@@ -795,20 +852,14 @@ class ArtemisInfoVis:
         elif key == "suitability":
             self._draw_suitability()
 
-        # Restore zoom
-        if self._map_ax is not None and self._cur_xlim is not None:
-            self._map_ax.set_xlim(self._cur_xlim)
-            self._map_ax.set_ylim(self._cur_ylim)
+        # Save default map limits and then restore user zoom if active.
+        if self._map_ax is not None:
+            self._base_xlim = self._map_ax.get_xlim()
+            self._base_ylim = self._map_ax.get_ylim()
+        self._apply_zoom_to_map()
 
         # Click marker
-        if self._map_ax is not None and self._click_col is not None:
-            self._map_ax.plot(self._click_col, self._click_row,
-                              "+", color="#ff3355", markersize=18,
-                              markeredgewidth=2.5, zorder=10)
-            self._map_ax.plot(self._click_col, self._click_row,
-                              "o", color="none", markersize=14,
-                              markeredgecolor="#ff3355", markeredgewidth=1.5,
-                              zorder=10)
+        self._draw_click_marker()
 
         # Rectangle selector for zoom
         if self._map_ax is not None:
@@ -918,6 +969,14 @@ class ArtemisInfoVis:
         hi = np.nanpercentile(illum, 98)
         return np.clip((illum - lo) / (hi - lo + 1e-9), 0, 1)
 
+    def _get_norm_illum(self):
+        v = self._get_cached("norm_illum")
+        if v is None:
+            illum = self._get_illum_aligned()
+            v = self._norm_illum(illum) if illum is not None else None
+            self._set_cached("norm_illum", v)
+        return v
+
     # =====================================================================
     #  CHAPTER 1: THE LANDSCAPE
     #  SciVis: hillshaded terrain map
@@ -926,10 +985,7 @@ class ArtemisInfoVis:
     # =====================================================================
 
     def _draw_landscape(self):
-        gs = GridSpec(2, 4, figure=self._fig,
-                      width_ratios=[3, 1.6, 0.8, 0.8],
-                      hspace=0.35, wspace=0.40,
-                      left=0.04, right=0.97, top=0.92, bottom=0.07)
+        gs = self._chapter_gridspec()
 
         # ── main map: hillshaded terrain ──────────────────────────────────
         ax_map = self._fig.add_subplot(gs[:, 0])
@@ -1059,12 +1115,10 @@ class ArtemisInfoVis:
     # =====================================================================
 
     def _draw_shadow(self):
-        gs = GridSpec(2, 4, figure=self._fig,
-                      width_ratios=[3, 1.6, 0.8, 0.8],
-                      hspace=0.35, wspace=0.40,
-                      left=0.04, right=0.97, top=0.92, bottom=0.07)
+        gs = self._chapter_gridspec()
 
         illum = self._get_illum_aligned()
+        norm_ill = self._get_norm_illum()
         elev  = self._get_elev()
         H, W  = elev.shape
 
@@ -1072,8 +1126,7 @@ class ArtemisInfoVis:
         ax_map = self._fig.add_subplot(gs[:, 0])
         self._map_ax = ax_map
 
-        if illum is not None:
-            norm_ill = self._norm_illum(illum)
+        if norm_ill is not None:
             im = ax_map.imshow(norm_ill * 100, cmap="plasma",
                                vmin=0, vmax=100, origin="upper",
                                aspect="equal", interpolation="bilinear")
@@ -1096,8 +1149,8 @@ class ArtemisInfoVis:
                          "West \u2190 East (px)", "South \u2190 North (px)",
                          title_size=10)
 
-        if self._show_annotations.get() and illum is not None:
-            self._annotate_shadow(ax_map, self._norm_illum(illum))
+        if self._show_annotations.get() and norm_ill is not None:
+            self._annotate_shadow(ax_map, norm_ill)
 
         # ── donut chart: % area in shadow (InfoVis) ───────────────────────
         ax_donut = self._fig.add_subplot(gs[0, 1])
@@ -1196,14 +1249,11 @@ class ArtemisInfoVis:
     # =====================================================================
 
     def _draw_sunlight(self):
-        gs = GridSpec(2, 4, figure=self._fig,
-                      width_ratios=[3, 1.6, 0.8, 0.8],
-                      hspace=0.35, wspace=0.40,
-                      left=0.04, right=0.97, top=0.92, bottom=0.07)
+        gs = self._chapter_gridspec()
 
         elev  = self._get_elev()
         hs    = self._get_hillshade()
-        illum = self._get_illum_aligned()
+        norm_ill = self._get_norm_illum()
         H, W  = elev.shape
 
         # ── main map: hillshade + illumination contours ───────────────────
@@ -1213,8 +1263,7 @@ class ArtemisInfoVis:
         ax_map.imshow(hs, cmap="gray", vmin=0, vmax=1, origin="upper",
                       aspect="equal", interpolation="bilinear", alpha=0.75)
 
-        if illum is not None:
-            norm_ill = self._norm_illum(illum)
+        if norm_ill is not None:
             ax_map.imshow(norm_ill * 100, cmap="YlOrRd", vmin=0, vmax=100,
                           alpha=0.50, origin="upper", aspect="equal",
                           interpolation="bilinear")
@@ -1248,9 +1297,8 @@ class ArtemisInfoVis:
                          "West \u2190 East (px)", "South \u2190 North (px)",
                          title_size=10)
 
-        if self._show_annotations.get() and illum is not None:
-            norm_ill_s = self._norm_illum(illum)
-            blurred = ndimage.gaussian_filter(norm_ill_s, sigma=max(H, W) / 40)
+        if self._show_annotations.get() and norm_ill is not None:
+            blurred = ndimage.gaussian_filter(norm_ill, sigma=max(H, W) / 40)
             mr, mc = max(1, H // 10), max(1, W // 10)
             inner = blurred[mr:H-mr, mc:W-mc]
             br, bc = np.unravel_index(np.argmax(inner), inner.shape)
@@ -1266,9 +1314,9 @@ class ArtemisInfoVis:
 
         # ── bar chart: illumination bands (InfoVis) ───────────────────────
         ax_bands = self._fig.add_subplot(gs[0, 1])
-        if illum is not None:
-            norm_ill = self._norm_illum(illum) * 100
-            valid = norm_ill[np.isfinite(norm_ill)].ravel()
+        if norm_ill is not None:
+            illum_pct = norm_ill * 100
+            valid = illum_pct[np.isfinite(illum_pct)].ravel()
             band_edges = [0, 20, 40, 60, 80, 100]
             band_labels = ["0-20%", "20-40%", "40-60%", "60-80%", "80-100%"]
             counts = []
@@ -1288,8 +1336,8 @@ class ArtemisInfoVis:
 
         # ── cross-section profile (InfoVis: filtering/slicing, Lec 2) ─────
         ax_prof = self._fig.add_subplot(gs[1, 1])
-        if illum is not None:
-            norm_ill_full = self._norm_illum(illum)
+        if norm_ill is not None:
+            norm_ill_full = norm_ill
             blurred = ndimage.gaussian_filter(norm_ill_full, sigma=max(H, W)/40)
             mr, mc = max(1, H // 10), max(1, W // 10)
             inner_b = blurred[mr:H-mr, mc:W-mc]
@@ -1344,10 +1392,7 @@ class ArtemisInfoVis:
     # =====================================================================
 
     def _draw_suitability(self):
-        gs = GridSpec(2, 4, figure=self._fig,
-                      width_ratios=[3, 1.6, 0.8, 0.8],
-                      hspace=0.35, wspace=0.40,
-                      left=0.04, right=0.97, top=0.92, bottom=0.07)
+        gs = self._chapter_gridspec()
 
         suit = self._get_suitability()
         hs   = self._get_hillshade()
@@ -1406,7 +1451,7 @@ class ArtemisInfoVis:
 
         # Compute average scores in best zone
         slope = self._get_slope()
-        norm_ill = self._norm_illum()
+        norm_ill = self._get_norm_illum()
         flat_score = float(np.clip(1 - np.nanmean(slope[best_mask]) / 20, 0, 1))
         if norm_ill is not None:
             light_score = float(np.nanmean(norm_ill[best_mask]))
@@ -1537,7 +1582,8 @@ class ArtemisInfoVis:
 
         illum = self._get_illum_aligned()
         if illum is not None and 0 <= row < illum.shape[0] and 0 <= col < illum.shape[1]:
-            norm_val = float(self._norm_illum(illum)[row, col])
+            norm_illum = self._get_norm_illum()
+            norm_val = float(norm_illum[row, col]) if norm_illum is not None else 0.0
             lines.append(f"  Illuminated: {norm_val*100:.1f}%")
             psr = self._get_psr_mask()
             if 0 <= row < psr.shape[0] and 0 <= col < psr.shape[1]:
@@ -1552,7 +1598,11 @@ class ArtemisInfoVis:
                 lines.append(f"  Suitability: {sv:.2f} ({label})")
 
         self._lbl_click.configure(text="\n".join(lines), fg=ACCENT)
-        self._refresh_chapter()
+        if ch["key"] == "sunlight":
+            self._refresh_chapter()
+        else:
+            self._draw_click_marker()
+            self._canvas.draw_idle()
 
     def _on_rect_select(self, eclick, erelease):
         x1, y1 = eclick.xdata, eclick.ydata
@@ -1562,25 +1612,32 @@ class ArtemisInfoVis:
         self._zoom_stack.append((self._cur_xlim, self._cur_ylim))
         self._cur_xlim = (min(x1, x2), max(x1, x2))
         self._cur_ylim = (max(y1, y2), min(y1, y2))
-        self._refresh_chapter()
+        self._apply_zoom_to_map()
+        self._canvas.draw_idle()
 
     def _zoom_back(self):
         if self._zoom_stack:
             self._cur_xlim, self._cur_ylim = self._zoom_stack.pop()
         else:
             self._cur_xlim = self._cur_ylim = None
-        self._refresh_chapter()
+        self._apply_zoom_to_map()
+        self._canvas.draw_idle()
 
     def _reset_zoom(self):
         self._zoom_stack.clear()
         self._cur_xlim = self._cur_ylim = None
-        self._refresh_chapter()
+        self._apply_zoom_to_map()
+        self._canvas.draw_idle()
 
     def _clear_marker(self):
         self._click_col = self._click_row = None
         self._lbl_click.configure(
             text="Click the map to explore values", fg=FG_DIM)
-        self._refresh_chapter()
+        if CHAPTERS[self._chapter_idx]["key"] == "sunlight":
+            self._refresh_chapter()
+        else:
+            self._clear_click_marker_artists()
+            self._canvas.draw_idle()
 
     def _on_scale_change(self, event=None):
         if not self.store.heightmaps:
