@@ -90,6 +90,7 @@ SAFE_CLR  = "#00e676"
 DANGER    = "#ff5252"
 PSR_CLR   = "#1565c0"
 WARM_ORG  = "#ff9800"
+IS_MACOS  = (sys.platform == "darwin")
 
 # ── chapter definitions ─────────────────────────────────────────────────────
 CHAPTERS = [
@@ -561,6 +562,17 @@ class ArtemisInfoVis:
         self._build_main_area()
         self._build_bottom_bar()
 
+    @staticmethod
+    def _control_style_kwargs(bg_color):
+        """Ensure control background colours are respected on macOS Tk."""
+        if not IS_MACOS:
+            return {}
+        return {
+            "highlightbackground": bg_color,
+            "highlightcolor": bg_color,
+            "highlightthickness": 0,
+        }
+
     def _build_title_bar(self):
         """Title banner — first visual element seen (Lec 8: reading order)."""
         bar = tk.Frame(self.root, bg="#060618", height=50)
@@ -660,7 +672,8 @@ class ArtemisInfoVis:
                 bg=BG_CARD, fg=FG_WHITE, activebackground=ACCENT,
                 activeforeground=BG_DARK,
                 font=("Segoe UI", 8, "bold"), relief=tk.FLAT, bd=0,
-                padx=8, pady=4, cursor="hand2")
+                padx=8, pady=4, cursor="hand2",
+                **self._control_style_kwargs(BG_CARD))
             b.pack(side=tk.LEFT, padx=2)
             self._chap_btns.append(b)
 
@@ -677,14 +690,18 @@ class ArtemisInfoVis:
                        command=self._refresh_chapter,
                        bg=BG_CARD, fg=FG_WHITE, selectcolor=BG_DARK,
                        activebackground=BG_CARD,
-                       font=("Segoe UI", 8)).grid(row=0, column=0, padx=4)
+                       font=("Segoe UI", 8),
+                       **self._control_style_kwargs(BG_CARD)).grid(
+                           row=0, column=0, padx=4)
 
         tk.Checkbutton(ctrl, text="PSR overlay",
                        variable=self._show_psr,
                        command=self._refresh_chapter,
                        bg=BG_CARD, fg=FG_WHITE, selectcolor=BG_DARK,
                        activebackground=BG_CARD,
-                       font=("Segoe UI", 8)).grid(row=0, column=1, padx=4)
+                       font=("Segoe UI", 8),
+                       **self._control_style_kwargs(BG_CARD)).grid(
+                           row=0, column=1, padx=4)
 
         tk.Label(ctrl, text="Scale:", bg=BG_CARD, fg=FG_WHITE,
                  font=("Segoe UI", 8)).grid(row=0, column=2, padx=(10, 2))
@@ -704,15 +721,21 @@ class ArtemisInfoVis:
         tk.Button(zoom_frame, text="Reset Zoom", command=self._reset_zoom,
                   bg=BG_PANEL, fg=FG_WHITE, activebackground=ACCENT,
                   font=("Segoe UI", 7, "bold"), relief=tk.FLAT,
-                  padx=6, pady=2, cursor="hand2").pack(side=tk.LEFT, padx=2)
+                  padx=6, pady=2, cursor="hand2",
+                  **self._control_style_kwargs(BG_PANEL)).pack(
+                      side=tk.LEFT, padx=2)
         tk.Button(zoom_frame, text="Zoom Back", command=self._zoom_back,
                   bg=BG_PANEL, fg=FG_WHITE, activebackground=ACCENT,
                   font=("Segoe UI", 7, "bold"), relief=tk.FLAT,
-                  padx=6, pady=2, cursor="hand2").pack(side=tk.LEFT, padx=2)
+                  padx=6, pady=2, cursor="hand2",
+                  **self._control_style_kwargs(BG_PANEL)).pack(
+                      side=tk.LEFT, padx=2)
         tk.Button(zoom_frame, text="Clear Marker", command=self._clear_marker,
                   bg=BG_PANEL, fg=FG_WHITE, activebackground=ACCENT,
                   font=("Segoe UI", 7, "bold"), relief=tk.FLAT,
-                  padx=6, pady=2, cursor="hand2").pack(side=tk.LEFT, padx=2)
+                  padx=6, pady=2, cursor="hand2",
+                  **self._control_style_kwargs(BG_PANEL)).pack(
+                      side=tk.LEFT, padx=2)
 
         # Status
         self._lbl_status = tk.Label(
@@ -735,9 +758,21 @@ class ArtemisInfoVis:
         # Update button highlights
         for i, b in enumerate(self._chap_btns):
             if i == self._chapter_idx:
-                b.configure(bg=GOLD, fg=BG_DARK, font=("Segoe UI", 8, "bold"))
+                cfg = {
+                    "bg": GOLD,
+                    "fg": BG_DARK,
+                    "font": ("Segoe UI", 8, "bold"),
+                }
+                cfg.update(self._control_style_kwargs(GOLD))
+                b.configure(**cfg)
             else:
-                b.configure(bg=BG_CARD, fg=FG_WHITE, font=("Segoe UI", 8))
+                cfg = {
+                    "bg": BG_CARD,
+                    "fg": FG_WHITE,
+                    "font": ("Segoe UI", 8),
+                }
+                cfg.update(self._control_style_kwargs(BG_CARD))
+                b.configure(**cfg)
 
         # Update narrative
         self._lbl_chnum.configure(text=ch["icon"])
