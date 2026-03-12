@@ -1,33 +1,3 @@
-"""
-COMP4097 - Problem 1: Explorative Visualisation
-Lunar South Pole Interactive Explorer for Artemis III Landing Site Selection
-
-Parts A, B & C:
-  A – Multi-scale interactive maps, click-to-sample, zoom, illumination overlay
-  B – Side-by-side comparison of 3D displacement-map rendering vs isoline/
-      isocontour representation, with full GUI parameter control
-  C – Creative additions: slope/gradient overlay, permanently shadowed region
-      (PSR) detection, composite landing suitability scoring heatmap,
-      elevation profile cross-sections
-
-Lecture concepts applied:
-  - Visualisation pipeline  (data -> format -> filter -> map -> render)
-  - Colour mapping & colourmap design  (perceptual uniformity, diverging scales)
-  - Height / displacement plots  (S_displ(x) = x + n(x)*f(x))
-  - Contouring / isolines  (marching squares, isovalue control)
-  - Colour banding <-> contour duality
-  - Inverse mapping  (click-to-sample)
-  - Multi-scale overview -> detail
-  - Multi-variate overlay  (elevation + illumination)
-  - Derived scalar quantities from gradient  (slope = |grad f|)
-  - Information layering  (PSR regions, suitability scoring)
-  - Filtering / slicing  (1D cross-sections through 2D scalar fields)
-
-Requirements: numpy, matplotlib, scipy, Pillow, rasterio (or tifffile fallback)
-Run:  python3 problem1.py
-Dataset:  ./dataset/heightmaps/*.tif   ./dataset/illumination/*.tif
-"""
-
 import os, sys, glob
 import tkinter as tk
 from tkinter import ttk, messagebox
