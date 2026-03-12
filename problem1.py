@@ -67,6 +67,11 @@ class LunarDataset:
         self.is_georeferenced = False
         self.georef_note = "No georeference metadata"
         self.calibration_note = "No calibration applied"
+        # GeoTIFF-embedded scale/offset (from src.scales / src.offsets via rasterio).
+        # rasterio exposes these but does NOT auto-apply them in .read().
+        # We capture them here and apply explicitly in _apply_height_calibration.
+        self.gdal_scale = None   # e.g. 0.5 for LROC LOLA LDEM products
+        self.gdal_offset = None  # e.g. 0.0 for HEIGHT; 1737400 for PLANETARY_RADIUS
         self._load()
 
     def _load(self):
@@ -91,6 +96,16 @@ class LunarDataset:
             if nodata is not None:
                 self.data[self.data == nodata] = np.nan
             self.crs = str(src.crs) if src.crs else None
+            # Capture GeoTIFF-embedded scale/offset (rasterio reads but does NOT apply).
+            # LROC LOLA LDEM products embed SCALING_FACTOR=0.5, OFFSET=0 for HEIGHT.
+            gdal_scales = src.scales   # tuple, one per band
+            gdal_offsets = src.offsets
+            if gdal_scales and gdal_offsets:
+                s, o = float(gdal_scales[0]), float(gdal_offsets[0])
+                # Only store if non-trivial (rasterio defaults to 1.0 / 0.0)
+                if s != 1.0 or o != 0.0:
+                    self.gdal_scale = s
+                    self.gdal_offset = o
             identity = rasterio.Affine.identity()
             has_non_identity_transform = (
                 self.transform is not None and
@@ -99,9 +114,28 @@ class LunarDataset:
             self.is_georeferenced = bool(self.crs) or has_non_identity_transform
             if self.is_georeferenced:
                 self.bounds = src.bounds
-                self.pixel_size = abs(self.transform.a)
+                raw_ps = abs(self.transform.a)
+                # Detect geographic CRS (pixel_size is in degrees, not metres).
+                # Convert to metres using the lunar reference sphere so that
+                # gradient / slope calculations receive consistent m/m units.
+                crs_lower = (self.crs or "").lower()
+                crs_is_geographic = (
+                    "degree" in crs_lower
+                    or "geog" in crs_lower
+                    or "geographic" in crs_lower
+                    or (raw_ps < 1.0 and "metre" not in crs_lower
+                        and "meter" not in crs_lower)
+                )
+                if crs_is_geographic:
+                    # 1 degree on Moon = LUNAR_RADIUS_KM * 1000 * pi/180 metres
+                    self.pixel_size = raw_ps * (np.pi / 180.0) * (LUNAR_RADIUS_KM * 1000.0)
+                    self.pixel_size_deg = raw_ps   # keep raw degrees for reference
+                else:
+                    self.pixel_size = raw_ps
+                    self.pixel_size_deg = None
                 if self.crs:
-                    self.georef_note = f"GeoTIFF CRS: {self.crs}"
+                    geo_tag = "(geographic, converted to m)" if crs_is_geographic else "(projected)"
+                    self.georef_note = f"GeoTIFF CRS: {self.crs} {geo_tag}"
                 else:
                     self.georef_note = "Affine transform present (CRS missing)"
             else:
@@ -151,22 +185,64 @@ class LunarDataset:
         if self.role != "heightmaps":
             self.calibration_note = "N/A (illumination layer)"
             return
+
+        # ── Priority 1: GeoTIFF-embedded scale/offset from rasterio metadata ──
+        # The official LROC LOLA LDEM GeoTIFFs embed SCALING_FACTOR=0.5 and
+        # OFFSET=0 (for HEIGHT above 1737.4 km sphere) in their GDAL metadata.
+        # rasterio exposes this via src.scales/src.offsets but does NOT apply it
+        # automatically.  Using this path avoids any dtype heuristics and is the
+        # most authoritative calibration available.
+        # Source: LROC PDS label (pds-geosciences.wustl.edu ldem_4.lbl):
+        #   HEIGHT = DN * SCALING_FACTOR  [metres above reference sphere]
+        if self.gdal_scale is not None and self.gdal_offset is not None:
+            # Guard against the PLANETARY_RADIUS variant (offset ~1.737e9 m).
+            # We want HEIGHT (elevation), not absolute radius.
+            offset = self.gdal_offset
+            if abs(offset) > 1e6:
+                # Offset is planetary radius in metres; subtract to get elevation
+                self.data = self.data * self.gdal_scale + offset - (LUNAR_RADIUS_KM * 1000.0)
+                self.calibration_note = (
+                    f"GeoTIFF metadata: DN*{self.gdal_scale} + {offset:.0f} - {LUNAR_RADIUS_KM*1000:.0f} -> elev m")
+            else:
+                self.data = self.data * self.gdal_scale + offset
+                self.calibration_note = (
+                    f"GeoTIFF metadata: DN*{self.gdal_scale} + {offset:.0f} -> elev m")
+            return
+
+        # ── Priority 2: dtype heuristics (fallback when metadata absent) ──
         try:
             dtype = np.dtype(self.raw_dtype)
         except Exception:
             dtype = self.data.dtype
         rmin, rmax = self.raw_min, self.raw_max
+
+        # Signed integer (e.g. int16): official LROC LOLA encoding.
+        # HEIGHT = DN * 0.5  (SCALING_FACTOR from PDS label ldem_4.lbl)
+        # DN range: -17758 to 21008 -> elevation -8879 to 10504 m
+        if np.issubdtype(dtype, np.signedinteger) and np.isfinite(rmax) and abs(rmax) > 1000:
+            self.data = self.data * LDEM_UINT_SCALE_M   # 0.5, no offset for signed DN
+            self.calibration_note = "DN->m (int16): elev = DN*0.5  [LROC LOLA PDS convention]"
+            return
+
+        # Unsigned integer (e.g. uint16): non-standard shifted encoding used in
+        # the bundled _uint variants; negative DNs shifted by +20000 to avoid
+        # unsigned underflow.  Fitted from paired float/uint products:
+        #   elev_m = uint_DN * 0.5 - 10000
         if np.issubdtype(dtype, np.unsignedinteger) and np.isfinite(rmax) and rmax > 1000:
             self.data = self.data * LDEM_UINT_SCALE_M + LDEM_UINT_OFFSET_M
-            self.calibration_note = "DN->m: elev = DN*0.5 - 10000"
+            self.calibration_note = "DN->m (uint16): elev = DN*0.5 - 10000  [shifted encoding]"
             return
+
+        # Float file already in kilometres (e.g. ldem_4.tif float32 -8.878..10.504 km).
+        # Confirmed by cross-check with signed-int product via PDS SCALING_FACTOR=0.5.
         if (np.issubdtype(dtype, np.floating) and
                 np.isfinite(rmin) and np.isfinite(rmax) and
                 -50.0 <= rmin <= 50.0 and -50.0 <= rmax <= 50.0):
             self.data = self.data * 1000.0
-            self.calibration_note = "km->m: elev = value*1000"
+            self.calibration_note = "km->m (float32): elev = value*1000"
             return
-        self.calibration_note = "Assumed metres (no conversion)"
+
+        self.calibration_note = "Assumed metres (no conversion applied)"
 
     def _clean(self):
         if np.any(np.abs(self.data) > 1e15):
@@ -849,7 +925,12 @@ class LunarExplorer:
 
         # -- surface with optional hill-shading --
         if self.shade_3d.get():
-            shade = self._compute_hillshade(Z)
+            # Pass the user-controlled azimuth and elevation sliders to the
+            # hillshade so the light direction is consistent with the viewpoint.
+            shade = self._compute_hillshade(
+                Z, hm,
+                azimuth_deg=int(self.azi_var.get()),
+                altitude_deg=int(self.elev_var.get()))
             facecolors = cmap(norm(Z))
             facecolors[..., :3] *= shade[..., np.newaxis]
             facecolors = np.clip(facecolors, 0, 1)
@@ -901,8 +982,15 @@ class LunarExplorer:
         """
         Lecture 4 - Contouring / isolines:
         I(f0) = {x in D | f(x) = f0}
-        Contours are always closed curves and never self-intersect.
-        matplotlib.contour implements marching squares internally.
+        Two key mathematical properties (from lectures):
+          - Contours are always CLOSED CURVES (except where they exit the domain)
+          - Contours NEVER self-intersect and are nested: for a continuous scalar
+            field, two distinct isoline levels cannot cross, because a point
+            cannot simultaneously satisfy f(x)=f0 and f(x)=f1 (f0 != f1).
+        matplotlib.contour implements marching squares internally: each grid
+        cell's four vertices are encoded as a 4-bit inside/outside mask giving
+        16 topological cases, with contour-edge crossings located by linear
+        interpolation.  This guarantees the nesting property is preserved.
         """
         if not self.contour_on.get():
             return
@@ -911,6 +999,13 @@ class LunarExplorer:
         hi = np.ceil(vmax / interval) * interval + interval
         levels = np.arange(lo, hi, interval)
         if len(levels) > 60:
+            # Guard: a very coarse interval over a large elevation range can
+            # still produce hundreds of levels, which degrades performance and
+            # readability.  Cap at 40 evenly-spaced levels.  This means the
+            # exact user-specified interval is not preserved when the cap fires,
+            # so we print an informational message.
+            print(f"[INFO] Contour interval {interval} m yields {len(levels)} levels "
+                  f"over {vmax-vmin:.0f} m range; capping at 40 evenly-spaced levels.")
             levels = np.linspace(vmin, vmax, 40)
 
         h, w = data.shape
@@ -972,11 +1067,51 @@ class LunarExplorer:
     # ==================================================================
 
     # -- C1: Slope / Gradient overlay ----------------------------------
+    # LROC LDEM filename -> degrees-per-pixel (used as fallback when CRS metadata absent)
+    _LDEM_FNAME_DEG_PX = {
+        "ldem_16": 1.0 / 16,   # 16 px/degree
+        "ldem_4":  1.0 / 4,    # 4  px/degree
+    }
+
+    def _pixel_size_metres(self, hm) -> float:
+        """
+        Return horizontal pixel spacing in metres for slope calculations.
+        Priority: (1) already-converted pixel_size from CRS metadata,
+                  (2) filename heuristic for known LROC LDEM products,
+                  (3) warn and return 1.0 (will give dimensionless gradient).
+        After _load_rasterio, hm.pixel_size is already in metres when CRS is
+        geographic — no further conversion needed here.
+        """
+        if hm.pixel_size is not None and hm.pixel_size > 1.0:
+            # Already in metres (either projected CRS or converted from degrees)
+            return hm.pixel_size
+        if hm.pixel_size is not None and 0 < hm.pixel_size <= 1.0:
+            # pixel_size arrived here still in degrees — convert now as fallback
+            # (shouldn't happen after the _load_rasterio fix, but defensive)
+            return hm.pixel_size * (np.pi / 180.0) * (LUNAR_RADIUS_KM * 1000.0)
+        # No CRS metadata: try to infer from filename
+        name_lower = hm.name.lower()
+        for key, deg_px in self._LDEM_FNAME_DEG_PX.items():
+            if key in name_lower:
+                ps_m = deg_px * (np.pi / 180.0) * (LUNAR_RADIUS_KM * 1000.0)
+                print(f"[INFO] No CRS for {hm.name}; using filename-derived "
+                      f"pixel_size = {ps_m:.1f} m ({deg_px:.4f} deg/px)")
+                return ps_m
+        print(f"[WARN] Cannot determine pixel_size for {hm.name}; "
+              "slope will be in m/pixel (unitless) — values unreliable.")
+        return 1.0   # last resort: gradient in m/pixel (wrong, but won't crash)
+
     def _compute_slope_grid(self):
         """
         Lecture 4 — derived scalar quantities from gradient.
         Compute slope magnitude |grad f| from elevation, convert to degrees.
         Slope = arctan(|grad f|) is critical for landing safety.
+
+        The Sobel kernel sums weighted differences over a 3×3 neighbourhood.
+        For a unit ramp (1 unit per pixel) the output is 8, so dividing by 8
+        recovers the gradient per pixel.  Dividing by the pixel spacing (in the
+        same units as the elevation, i.e. metres) converts to a dimensionless
+        rise/run ratio, and arctan gives the angle in degrees.
         """
         hm = self._cur_hm()
         if self._cached_slope is not None and self._cached_slope_idx == self.scale_idx:
@@ -985,15 +1120,18 @@ class LunarExplorer:
         # Compute gradient using Sobel for better noise handling
         dx = ndimage.sobel(data, axis=1).astype(np.float64)
         dy = ndimage.sobel(data, axis=0).astype(np.float64)
-        # Account for pixel spacing if known
-        if hm.pixel_size is not None and hm.pixel_size > 0:
-            dx /= (8.0 * hm.pixel_size)   # Sobel divides by 8*spacing
-            dy /= (8.0 * hm.pixel_size)
-        else:
-            dx /= 8.0
-            dy /= 8.0
+        # pixel_size must be in metres (same units as elevation after calibration)
+        ps_m = self._pixel_size_metres(hm)
+        # Divide by 8*ps_m: the factor of 8 undoes Sobel's implicit weighting;
+        # dividing by ps_m (metres) yields a dimensionless rise/run gradient.
+        dx /= (8.0 * ps_m)
+        dy /= (8.0 * ps_m)
         grad_mag = np.sqrt(dx**2 + dy**2)
         slope_deg = np.degrees(np.arctan(grad_mag))
+        print(f"[DEBUG] Slope grid: pixel_size={ps_m:.1f} m  "
+              f"slope p5={np.nanpercentile(slope_deg,5):.1f}°  "
+              f"p50={np.nanpercentile(slope_deg,50):.1f}°  "
+              f"p95={np.nanpercentile(slope_deg,95):.1f}°")
         self._cached_slope = slope_deg
         self._cached_slope_idx = self.scale_idx
         return slope_deg
@@ -1304,11 +1442,24 @@ class LunarExplorer:
         ys = np.linspace(y1, y2, N)
         elevs = np.array([hm.sample(x, y) for x, y in zip(xs, ys)])
 
-        # Compute distance along profile in metres
-        if hm.pixel_size is not None:
+        # Compute distance along profile in metres.
+        # xs/ys are in map coordinates: degrees for geographic CRS, metres for
+        # projected CRS, or pixel indices when no transform is available.
+        # _pixel_size_metres() always returns metres/pixel after the CRS fix,
+        # but we must distinguish the coordinate units of xs/ys themselves.
+        if getattr(hm, 'pixel_size_deg', None) is not None:
+            # Geographic CRS: xs/ys are in degrees -> convert to metres
+            m_per_deg = LUNAR_RADIUS_KM * 1000.0 * np.pi / 180.0
+            dists = np.sqrt(((xs - x1) * m_per_deg)**2 +
+                            ((ys - y1) * m_per_deg)**2)
+        elif hm.pixel_size is not None:
+            # Projected CRS: xs/ys are already in metres
             dists = np.sqrt((xs - x1)**2 + (ys - y1)**2)
         else:
-            dists = np.linspace(0, np.sqrt((x2-x1)**2 + (y2-y1)**2), N)
+            # No georeference: xs/ys are pixel indices; scale by pixel_size_metres
+            ps_m = self._pixel_size_metres(hm)
+            dists = np.linspace(
+                0, np.sqrt((x2 - x1)**2 + (y2 - y1)**2) * ps_m, N)
 
         # Also sample illumination if available
         il = self._cur_il()
@@ -1395,16 +1546,34 @@ class LunarExplorer:
         return X, Y, Z
 
     @staticmethod
-    def _compute_hillshade(Z, azimuth_deg=315, altitude_deg=45):
+    def _compute_hillshade(Z, hm=None, azimuth_deg=315, altitude_deg=45):
         """
         Lambertian hill-shading (Lecture 4):
         Shading acts as an additional perceptual cue, emphasising
         fine-grained (small-scale) data variations that would be
         invisible in a flat colour map alone.
+
+        azimuth_deg / altitude_deg are passed from the interactive sliders
+        so the light direction stays consistent with the user's viewpoint.
+
+        The gradient is scaled by pixel_size (metres/pixel) so that the
+        slope angle feeding into the Lambertian term is physically correct
+        (rise/run in m/m, not m/pixel).  For georeferenced LROC data the
+        pixel_size is derived from the CRS after degree->metre conversion.
+        When unavailable the gradient is dimensionless but the normalisation
+        at the end still produces a visually plausible result.
         """
         az = np.radians(azimuth_deg)
         alt = np.radians(altitude_deg)
+        # np.gradient returns dZ/d(row) and dZ/d(col) in units of m/pixel.
+        # Dividing by pixel_size_m converts to dimensionless rise/run (m/m)
+        # so that arctan gives the true surface angle.
         dy, dx = np.gradient(Z)
+        if hm is not None and hm.pixel_size is not None and hm.pixel_size > 0:
+            ps = hm.pixel_size   # already in metres after _load_rasterio fix
+            dx /= ps
+            dy /= ps
+        # else: gradient stays in m/pixel; visually plausible but not calibrated
         slope = np.sqrt(dx**2 + dy**2)
         aspect = np.arctan2(-dy, dx)
         shade = (np.sin(alt) * np.cos(np.arctan(slope)) +
