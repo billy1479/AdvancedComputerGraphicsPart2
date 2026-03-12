@@ -279,7 +279,6 @@ class LunarExplorer:
     VIEW_MODES = [
         "2D Contour Map",
         "3D Displacement Map",
-        "Side-by-Side Comparison",
     ]
 
     # 3-D surface sub-sampling cap (max grid points per axis)
@@ -725,10 +724,8 @@ class LunarExplorer:
         mode = self.view_var.get()
         if mode == self.VIEW_MODES[0]:
             self._render_2d()
-        elif mode == self.VIEW_MODES[1]:
-            self._render_3d()
         else:
-            self._render_sidebyside()
+            self._render_3d()
 
     def _schedule_render(self, delay_ms=80):
         """Debounce expensive full redraws while sliders are dragged."""
@@ -892,98 +889,6 @@ class LunarExplorer:
         self.cbar = self.fig.colorbar(
             sm, ax=ax3, label="Elevation (m)",
             shrink=0.65, pad=0.08, aspect=25)
-
-        self.fig.tight_layout()
-        self.canvas.draw_idle()
-
-    # ==================================================================
-    #  SIDE-BY-SIDE COMPARISON  (Part B core requirement)
-    #
-    #  Directly compares 3D perspective displacement map rendering
-    #  against isoline / isocontour representation so the user can
-    #  evaluate trade-offs: shading cues vs precision, occlusion vs
-    #  quantitative readability.
-    # ==================================================================
-
-    def _render_sidebyside(self):
-        self.fig.clf()
-        self.selector = None
-        self.cbar = None
-
-        ax2d = self.fig.add_subplot(121)
-        ax3d = self.fig.add_subplot(122, projection="3d")
-        self.ax = ax2d
-        self.ax3d = ax3d
-
-        hm = self._cur_hm()
-        data, ext = hm.data, hm.extent
-        vmin, vmax = float(np.nanmin(data)), float(np.nanmax(data))
-
-        # -- LEFT: 2-D contour map --
-        self.im = ax2d.imshow(
-            data, cmap=self.cmap_var.get(), extent=ext,
-            origin="upper", vmin=vmin, vmax=vmax,
-            aspect="equal", interpolation="bilinear")
-        self._overlay_contours_2d(ax2d, data, ext, vmin, vmax)
-        self._overlay_illumination(ax2d)
-        self._overlay_slope(ax2d)
-        self._overlay_psr(ax2d)
-        self._overlay_suitability(ax2d)
-        self._draw_profile_on_map(ax2d)
-        if self.cur_xlim is not None:
-            ax2d.set_xlim(self.cur_xlim)
-            ax2d.set_ylim(self.cur_ylim)
-        ax2d.set_title("Isoline / Contour View", fontsize=10, fontweight="bold")
-        self._set_axis_labels(ax2d, hm)
-
-        # -- RIGHT: 3-D displacement map --
-        X, Y, Z = self._prepare_3d_grid(data, ext)
-        vexag = float(self.vexag_var.get())
-
-        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
-        cmap = matplotlib.colormaps.get_cmap(self.cmap_var.get())
-
-        if self.shade_3d.get():
-            shade = self._compute_hillshade(Z)
-            fc = cmap(norm(Z))
-            fc[..., :3] *= shade[..., np.newaxis]
-            fc = np.clip(fc, 0, 1)
-            ax3d.plot_surface(X, Y, Z * vexag,
-                              facecolors=fc, rstride=1, cstride=1,
-                              linewidth=0, antialiased=False, shade=False)
-        else:
-            ax3d.plot_surface(X, Y, Z * vexag,
-                              cmap=self.cmap_var.get(),
-                              vmin=vmin * vexag, vmax=vmax * vexag,
-                              rstride=1, cstride=1,
-                              linewidth=0, antialiased=False)
-
-        if self.contour_3d_on.get() and self.contour_on.get():
-            self._draw_contours_3d(ax3d, X, Y, Z, vmin, vmax, vexag)
-
-        ax3d.view_init(elev=int(self.elev_var.get()),
-                       azim=int(self.azi_var.get()))
-        ax3d.set_title(
-            f"3D Displacement Map  (x{vexag:.1f})",
-            fontsize=10, fontweight="bold")
-        self._set_axis_labels_3d(ax3d, hm, vexag)
-
-        # shared elevation colour bar
-        sm = matplotlib.cm.ScalarMappable(cmap=cmap, norm=norm)
-        sm.set_array([])
-        self.cbar = self.fig.colorbar(
-            sm, ax=[ax2d, ax3d], label="Elevation (m)",
-            shrink=0.7, pad=0.03, aspect=28)
-        self._draw_active_overlay_scales(
-            ax2d, start_pad=0.14, pad_step=0.08, shrink=0.85, aspect=42)
-
-        # rectangle selector on the 2-D panel
-        self.selector = RectangleSelector(
-            ax2d, self._on_rect_select, useblit=True, button=[1, 3],
-            minspanx=5, minspany=5, spancoords="pixels",
-            interactive=True,
-            props=dict(facecolor="cyan", edgecolor="white",
-                       alpha=0.25, linewidth=1.5))
 
         self.fig.tight_layout()
         self.canvas.draw_idle()
@@ -1794,7 +1699,7 @@ class LunarExplorer:
         self.elev_lbl.config(text=f"{int(float(self.elev_var.get()))} deg")
         self.vexag_lbl.config(text=f"{float(self.vexag_var.get()):.1f}x")
         mode = self.view_var.get()
-        if mode in (self.VIEW_MODES[1], self.VIEW_MODES[2]):
+        if mode == self.VIEW_MODES[1]:
             # Azimuth/elevation can be updated interactively without
             # rebuilding the full figure. Vertical exaggeration changes
             # surface geometry, so keep it as a full render (debounced).
